@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Test
+        run: |
+          cargo fmt -- --check
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build release ZIP
+        shell: powershell
+        run: |
+          $stage = Join-Path $PWD 'release-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item '.\target\release\CloudFolderService.exe' $stage
+          Copy-Item '.\CloudFolder.ps1' $stage
+          Copy-Item '.\Install CloudFolder.cmd' $stage
+          Copy-Item '.\CloudFolder Manager.cmd' $stage
+          Copy-Item '.\Uninstall CloudFolder.cmd' $stage
+          Copy-Item '.\README.md' $stage
+          Copy-Item '.\LICENSE' $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath '.\CloudFolder-windows-x64.zip' -Force
+          $hash = (Get-FileHash '.\CloudFolder-windows-x64.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  CloudFolder-windows-x64.zip" | Set-Content '.\CloudFolder-windows-x64.zip.sha256' -Encoding ascii
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' `
+            '.\CloudFolder-windows-x64.zip' `
+            '.\CloudFolder-windows-x64.zip.sha256' `
+            --repo '${{ github.repository }}' `
+            --title 'CloudFolder ${{ github.ref_name }}' `
+            --generate-notes

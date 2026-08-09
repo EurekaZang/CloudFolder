@@ -1,0 +1,34 @@
+[mount]
+rclone_exe = "C:\\Program Files\\CloudFolder\\rclone.exe"
+rclone_config = "C:\\ProgramData\\CloudFolder\\mounts\\example\\rclone.conf"
+remote = "remote:"
+mount_point = "C:\\Users\\Alice\\CloudFolder\\Example"
+cache_dir = "C:\\.CloudFolderCache\\example"
+volume_name = "Example"
+vfs_cache_mode = "full"
+vfs_cache_max_size = "8Gi"
+vfs_cache_max_age = "168h"
+vfs_cache_min_free_space = "5Gi"
+vfs_write_back = "5s"
+dir_cache_time = "30s"
+attr_timeout = "1s"
+buffer_size = "16Mi"
+vfs_read_ahead = "64Mi"
+read_only = false
+rc_addr = "127.0.0.1:55770"
+
+[health]
+probe_interval_secs = 10
+probe_timeout_secs = 5
+startup_timeout_secs = 60
+failure_threshold = 3
+backoff_initial_secs = 1
+backoff_max_secs = 60
+stable_reset_secs = 180
+graceful_stop_secs = 15
+
+[logging]
+service_log = "C:\\ProgramData\\CloudFolder\\logs\\service-example.log"
+rclone_log = "C:\\ProgramData\\CloudFolder\\logs\\rclone-example.log"
+max_bytes = 20971520
+keep_files = 5

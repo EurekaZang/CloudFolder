@@ -1,0 +1,29 @@
+[package]
+name = "cloudfolder-service"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Reliability-oriented Windows service supervisor for rclone/WinFsp mounts"
+repository = "https://github.com/EurekaZang/CloudFolder"
+
+[[bin]]
+name = "CloudFolderService"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

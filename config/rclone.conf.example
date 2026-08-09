@@ -1,0 +1,10 @@
+[remote]
+type = sftp
+host = server.example.com
+user = alice
+port = 22
+key_file = C:\Users\Alice\.ssh\cloudfolder_ed25519
+known_hosts_file = C:\Users\Alice\.ssh\known_hosts
+host_key_algorithms = ssh-ed25519
+shell_type = unix
+idle_timeout = 20s

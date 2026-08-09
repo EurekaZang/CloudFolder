@@ -1,0 +1,13 @@
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+Cargo.lock text eol=lf
+LICENSE text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.example text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
