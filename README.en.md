@@ -1,101 +1,110 @@
 # CloudFolder
 
+[![Release](https://img.shields.io/github/v/release/EurekaZang/CloudFolder?display_name=tag)](https://github.com/EurekaZang/CloudFolder/releases)
+[![CI](https://github.com/EurekaZang/CloudFolder/actions/workflows/ci.yml/badge.svg)](https://github.com/EurekaZang/CloudFolder/actions/workflows/ci.yml)
+[![Windows](https://img.shields.io/badge/Windows-10%2F11%20x64-0078D4)](https://github.com/EurekaZang/CloudFolder/releases)
+[![License](https://img.shields.io/github/license/EurekaZang/CloudFolder)](LICENSE)
+
 **[中文](README.md) | [English](README.en.md) | [日本語](README.ja.md)**
 
-**Your remote Linux workspace, mounted locally. Your coding agent stays local.**
+> # Mount the server. Keep the Agent local.
+>
+> **Turn a remote Linux workspace into a local Windows folder without redeploying your coding agent.**
 
-CloudFolder turns a remote SSH/SFTP workspace into a normal Windows path for Explorer, VS Code, Claude Code, Codex, Python tooling, and other local applications. Files stay on the remote machine, while a local coding agent can read and edit them through Windows without being redeployed on every server.
+CloudFolder is a Windows **Remote Workspace Layer for AI coding agents and Linux development**.
 
-Under the filesystem layer, CloudFolder is built on **rclone + WinFsp**. A small Rust Windows Service keeps each mount alive, while the native **`cf.exe`** CLI bridges terminal commands back to the matching remote Linux working directory.
-
-> Current beginner-friendly installer target: **Windows 10/11 x64 + SSH/SFTP servers**.
-
-## Local Agent + remote Linux workflow
-
-The intended developer workflow is:
-
-```powershell
-cd (cf path lab)
-
-# The agent itself runs on your Windows machine.
-claude
-# or: codex
-
-# Files are edited locally through the mounted workspace.
-# Linux/Git/toolchain commands run on the remote machine in the matching cwd.
-cf here
-cf run -- git status
-cf run -- pytest -q
-cf run -- cargo test
-cf sh -- "git status && pytest -q"
-```
-
-`cf run` is more than an SSH shortcut. Before execution it waits until pending VFS writes have reached the server, maps the current Windows subdirectory to the corresponding absolute Linux directory, executes there with strict SSH host verification, returns the remote exit code, and then invalidates the local directory cache so new remote artifacts appear locally.
-
-This split is deliberate:
-
-- **local Windows path:** editor/agent file reads, targeted searches, edits, creates, renames and deletes;
-- **remote Linux via `cf run`:** Git, tests, builds, compilers, package managers, project interpreters and repository-wide commands that touch many small files.
-
-Running `git status` directly against a cold SFTP-mounted `.git` directory can be slow because Git performs many small random metadata/object accesses. CloudFolder therefore treats remote execution as a first-class part of the workspace rather than pretending every local CLI workload is equally suited to SFTP.
-
-### Teach Claude Code and Codex automatically
-
-CloudFolder can install a small **conditional** user-level instruction block for both agents:
-
-```powershell
-cf agent setup
-```
-
-It updates only the CloudFolder-managed block in:
+It exposes a remote SSH/SFTP directory as an ordinary Windows path that Claude Code, Codex, VS Code, Explorer, and other local applications can read and edit. When Git, tests, builds, package managers, or Linux tooling should execute on the server, `cf run` maps the current local directory to the matching remote Linux directory and coordinates write-back before and cache refresh after the command.
 
 ```text
-%USERPROFILE%\.claude\CLAUDE.md
-%USERPROFILE%\.codex\AGENTS.md
+Remote Linux: /home/alice/robotics
+                    │
+                    │ SFTP
+                    ▼
+Windows: C:\Users\Alice\CloudFolder\Lab\robotics
+                    │
+       ┌────────────┴────────────┐
+       │                         │
+       ▼                         ▼
+Claude Code / Codex          cf run -- pytest -q
+local file access            same remote cwd on Linux
 ```
 
-Existing instructions are preserved. The managed block tells the agent to edit mounted files normally, but to use `cf run`/`cf sh` for Git, builds, tests and large repository scans whenever it is inside a CloudFolder workspace. Setup is **opt-in**; the normal CloudFolder installer does not modify agent instructions automatically.
+**There is no CloudFolder daemon to install on the server, and there is no need to deploy another Claude Code or Codex instance there.** If the machine provides SSH/SFTP, CloudFolder can connect the workspace to your local environment.
 
-Check or remove the integration at any time:
+> Current beginner-friendly target: **Windows 10/11 x64 + SSH/SFTP Linux servers**.
 
-```powershell
-cf agent status
-cf agent remove
+---
+
+## CloudFolder in 15 seconds
+
+Remote development usually forces one of four compromises:
+
+1. **Install the agent on every server** — repeat agent login, permissions, Skills, MCP, environment setup, and version management on every machine.
+2. **Mount SFTP/SSHFS only** — files become local-looking, but Git/build/test/package-manager workloads can be slow over a network filesystem and there is no unified local-cwd → remote-cwd execution model.
+3. **Use a Remote-SSH IDE** — excellent remote development inside that IDE, but the workspace lives in an editor-specific remote context rather than as an ordinary system-wide Windows path for every local tool.
+4. **Synchronize copies** — now there is a local copy and a remote copy, with synchronization direction, timestamps, conflicts, and source-of-truth questions.
+
+CloudFolder takes a fifth approach:
+
+> **Keep the filesystem interface with the local agent. Keep the execution environment on remote Linux. Make both refer to the same workspace.**
+
+That is the product distinction.
+
+### Quick navigation
+
+- **See it first:** [30-second demo](#30-second-demo)
+- **Why not SSHFS/rclone alone:** [How does CloudFolder compare?](#how-does-cloudfolder-compare)
+- **Install it:** [Install in three steps](#install-in-three-steps)
+- **Use it with agents:** [Teach Claude Code / Codex once](#teach-claude-code--codex-once)
+- **Command reference:** [`cf.exe` reference](#cfexe-reference)
+- **Something broke:** [Troubleshooting](#troubleshooting)
+
+### Is CloudFolder for you right now?
+
+**Strong fit:** Windows is your primary desktop, Claude Code/Codex/IDE runs locally, while the project, Linux toolchain, GPU, or data lives on an SSH server.
+
+**Probably unnecessary:** you work exclusively inside VS Code Remote-SSH, or what you actually need is a full offline synchronization/mirroring product rather than a live remote filesystem.
+
+---
+
+# CloudFolder is not mainly a mount. It is a consistency layer.
+
+Many excellent tools can already make SFTP appear as a Windows drive.
+
+The harder developer problem is this sequence:
+
+```text
+Agent edits a file
+    ↓
+VFS may still be writing it back asynchronously
+    ↓
+pytest / git / cargo / cmake starts remotely
+    ↓
+the remote command must see the edit
+    ↓
+the command must run in the exact Linux directory corresponding to local cwd
+    ↓
+new remote artifacts must become visible in the local view
 ```
 
-## Install in three steps
+A generic mount plus `ssh host command` does not automatically guarantee the whole chain.
 
-1. Open the latest **GitHub Release** and download `CloudFolder-windows-x64.zip`.
-2. Extract it.
-3. Double-click **`Install CloudFolder.cmd`**.
+CloudFolder therefore defines a **Workspace Consistency Contract**:
 
-CloudFolder installs its runtime, WinFsp, and rclone automatically. It then asks only for information a normal SSH user already knows:
+1. **Resolve the mount** — identify which CloudFolder workspace owns the Windows path.
+2. **Map the cwd** — deterministically map the local relative path onto the saved absolute Linux root.
+3. **Flush barrier** — wait for queued/in-progress rclone VFS writes to reach zero before remote execution.
+4. **Strict SSH execution** — use the pinned key, `known_hosts`, and strict host verification.
+5. **Preserve exit status** — `cf run` returns the remote program's exit code.
+6. **Refresh the view** — invalidate the VFS directory view after execution so remote-generated artifacts appear locally.
 
-- a friendly name, such as `Lab Server`;
-- server IP address or hostname;
-- SSH port (`22` by default);
-- SSH username;
-- remote directory (leave it blank to use the SSH user's home directory);
-- local Windows folder (a sensible default is provided).
+> **The key CloudFolder feature is not “SFTP also mounts.” It is making the local filesystem plane and remote execution plane behave like one development workspace.**
 
-If the server does not already trust the CloudFolder key, Windows OpenSSH first shows the server fingerprint and then asks for the SSH password **once**. OpenSSH reads that password directly; CloudFolder does not capture or store it. From then on, the Windows service uses public-key authentication only.
+---
 
-After installation, open **Start menu → CloudFolder → CloudFolder Manager** to add, open, restart, diagnose, or remove mounts. New terminals also get the native `cf` command on `PATH`.
+# 30-second demo
 
-### PowerShell bootstrap
-
-If you prefer not to download the ZIP manually:
-
-```powershell
-iwr https://raw.githubusercontent.com/EurekaZang/CloudFolder/main/install.ps1 -OutFile "$env:TEMP\install-cloudfolder.ps1"
-powershell -ExecutionPolicy Bypass -File "$env:TEMP\install-cloudfolder.ps1"
-```
-
-The bootstrap downloads the latest GitHub Release, verifies it, and launches the same setup flow.
-
-## What it looks like
-
-For example, map:
+Map:
 
 ```text
 alice@server.example.com:/home/alice/projects
@@ -104,67 +113,581 @@ alice@server.example.com:/home/alice/projects
 to:
 
 ```text
-C:\Users\Alice\CloudFolder\Lab Server
+C:\Users\Alice\CloudFolder\Lab
 ```
 
-Windows applications then see ordinary paths such as:
+Then:
+
+```powershell
+# Enter a remote project through an ordinary Windows path.
+cd (cf path Lab)
+cd robotics
+
+# The coding agent still runs on Windows.
+codex
+# or: claude
+
+# See how CloudFolder maps this working directory.
+cf here
+
+# Git / tests / builds execute on remote Linux in the matching cwd.
+cf run -- git status
+cf run -- pytest -q
+cf run -- cargo test
+
+# Shell operators / pipelines / compound commands.
+cf sh -- "git status && pytest -q"
+
+# Open an interactive login shell at the same mapped remote cwd.
+cf shell
+```
+
+If Windows cwd is:
 
 ```text
-C:\Users\Alice\CloudFolder\Lab Server\robotics\train.py
+C:\Users\Alice\CloudFolder\Lab\robotics\src
 ```
 
-There is no separate FTP-style file browser and no reconnect command to remember after a network interruption. A coding agent can open this same path as its local workspace.
+and the mount's remote root is:
 
-## Why CloudFolder exists
+```text
+/home/alice/projects
+```
 
-`rclone mount` + WinFsp can already mount remote storage on Windows. The difficult part is making that mount behave like dependable machine infrastructure instead of a terminal command that eventually fails because of a network change, process crash, or system restart.
+then:
 
-CloudFolder adds the lifecycle and reliability layer:
+```powershell
+cf run -- pwd
+```
 
-- **one Windows Service per mount**, so one unhealthy server does not take other mounts down;
-- child-process liveness checks roughly every second;
-- a separate **killable filesystem health probe**, so a hung filesystem call cannot hang the watchdog itself;
-- automatic rclone replacement after crashes;
+runs in:
+
+```text
+/home/alice/projects/robotics/src
+```
+
+No manual mental mapping between a Windows project path and a remote shell path.
+
+---
+
+# Why is there a missing layer without CloudFolder?
+
+Remote development actually contains four separate problems. Most tools intentionally solve only some of them.
+
+## 1. Namespace: make the remote workspace part of the local namespace
+
+For local agents and applications, this is the most universal interface:
+
+```text
+C:\Users\Alice\CloudFolder\Lab\repo\src\main.py
+```
+
+A system path works with programs that understand normal Windows file APIs, not only one editor's remote-workspace abstraction.
+
+## 2. Execution locality: heavy work belongs on the server
+
+A remote project often depends on:
+
+- Linux toolchains;
+- CUDA / GPUs;
+- server-side Python / Conda / uv environments;
+- Docker;
+- large memory;
+- datasets that are not local;
+- existing build caches and dependencies.
+
+So “let the local agent see the files” should not mean “move every command back to Windows.”
+
+CloudFolder deliberately splits the work:
+
+| Work | Recommended location |
+|---|---|
+| Targeted reads/edits | Local CloudFolder path |
+| Create/rename/delete files | Local CloudFolder path |
+| Small targeted search | Local or remote |
+| Git | `cf run -- git ...` |
+| pytest / cargo / cmake / npm / uv | `cf run -- ...` |
+| Repository-wide `rg` / `find` | `cf run -- rg ...` |
+| Scripts tied to server environments | `cf run -- ...` |
+| Pipelines / redirects | `cf sh -- "..."` |
+
+This is not a workaround around the filesystem. It is an explicit acknowledgment that **SFTP network semantics are not local NVMe semantics**.
+
+## 3. Lifecycle: a mount should be infrastructure, not a terminal process
+
+The desired experience is:
+
+> “I configured it yesterday. It is still there after reboot. A network interruption recovers. A crashed mount process does not make me rebuild the command line.”
+
+CloudFolder uses a Rust Windows Service to supervise mounts rather than requiring a permanent interactive `rclone mount` terminal.
+
+## 4. Agent awareness: the agent needs the local-vs-remote rule
+
+Opt in once:
+
+```powershell
+cf agent setup
+```
+
+CloudFolder maintains only its own managed block in:
+
+```text
+%USERPROFILE%\.claude\CLAUDE.md
+%USERPROFILE%\.codex\AGENTS.md
+```
+
+Existing user instructions are preserved.
+
+The rule becomes simple:
+
+> **Edit through the local filesystem. Run Git/build/test/repository-wide operations through `cf run`. Do not start a second coding agent remotely just for this workspace.**
+
+---
+
+# How does CloudFolder compare?
+
+CloudFolder does not claim to have invented SSH, SFTP, FUSE, or remote development. It intentionally builds on mature infrastructure.
+
+The difference is the **product abstraction**.
+
+| Solution | What it is best at | File presentation | Command execution | Local-agent model | Main trade-off |
+|---|---|---|---|---|---|
+| **CloudFolder** | **Agent-native remote workspace** | Ordinary Windows path | `cf run` maps automatically to the same remote cwd | **Agent stays local; files are locally addressable; heavy work stays remote** | Beginner UI is currently focused on Windows + SFTP |
+| [SSHFS-Win](https://github.com/winfsp/sshfs-win) | SSHFS mounting on Windows | Windows drive / UNC | User manages SSH separately | Local agent can see the mount; execution plane is left to the user | Officially a minimal SSHFS port; developer workflow orchestration is not its purpose |
+| [rclone mount + WinFsp](https://rclone.org/commands/rclone_mount/) | General remote/VFS mount engine | Windows filesystem | User designs the execution path | Can provide the file plane, but cwd bridge, flush contract, service lifecycle, and agent policy are separate work | Powerful and flexible infrastructure rather than an opinionated developer product |
+| [RaiDrive](https://docs.raidrive.com/en/) / [ExpanDrive](https://docs.expandrive.com/integrations/sftp) / [Mountain Duck](https://docs.cyberduck.io/mountainduck/) | Polished cloud/SFTP desktop mounting | Explorer / drive / integrated folder | Mapped-cwd remote developer execution is not their core abstraction | Excellent general file-access products | CloudFolder is narrower and specifically couples coding-agent file access to Linux execution |
+| [VS Code Remote - SSH](https://code.visualstudio.com/docs/remote/ssh) | Full remote IDE experience | VS Code remote workspace | Remote | Excellent inside VS Code | Installs VS Code Server remotely; the workspace is primarily a VS Code remote context rather than a system-wide Windows path |
+| [WinSCP Sync](https://winscp.net/eng/docs/task_synchronize) | File transfer and synchronization | Local copy + remote copy | User decides | Agent can work on the local copy | Two copies and synchronization semantics instead of one live remote filesystem |
+
+## SSHFS-Win vs CloudFolder
+
+If the requirement is simply:
+
+> “Give me an SFTP drive letter.”
+
+SSHFS-Win is already a direct, mature answer.
+
+CloudFolder targets a more specific workflow:
+
+> “Let my local agent treat a Linux project as a local workspace, automatically send Git/Linux/toolchain commands back to the exact remote cwd, and keep the mount alive as infrastructure.”
+
+CloudFolder is not meant to replace every SSHFS-Win use case. It targets a higher-level **remote development / local agent** workflow.
+
+## rclone + WinFsp vs CloudFolder
+
+CloudFolder itself uses **rclone + WinFsp**. The official rclone `mount` documentation also states that on Windows a mount runs in foreground mode and `--daemon` is ignored. CloudFolder therefore treats Windows Service hosting, supervision, recovery, and mount lifecycle as part of the product layer rather than leaving process hosting to the user.
+
+You can build much of the stack yourself if you want to maintain:
+
+- rclone configuration;
+- WinFsp installation;
+- startup;
+- Windows services;
+- crash recovery;
+- health probes;
+- RC endpoints;
+- cache policy;
+- stale-mount cleanup;
+- SSH key and `known_hosts` handling;
+- Windows ACLs;
+- local cwd → remote cwd mapping;
+- VFS write flush barriers;
+- exit-code propagation;
+- post-execution cache refresh;
+- agent instructions.
+
+**CloudFolder exists because developing on a Linux server should not first require becoming a Windows filesystem-integration engineer.**
+
+## VS Code Remote-SSH vs CloudFolder
+
+VS Code Remote-SSH is an excellent remote IDE and is not mutually exclusive with CloudFolder.
+
+Its model is roughly:
+
+```text
+Local VS Code UI
+      ↕
+Remote VS Code Server + remote extensions + remote commands
+```
+
+CloudFolder's model is:
+
+```text
+Any local App / Agent
+      ↕ normal filesystem API
+Windows CloudFolder path
+      ↕
+actual remote files
+
+Local Agent
+      ↕ cf run
+actual remote Linux toolchain
+```
+
+If VS Code is your only environment, Remote-SSH may already be enough.
+
+If you want **Codex, Claude Code, Explorer, other IDEs, scripts, and desktop applications to share the same ordinary Windows workspace without moving the agent itself to the server**, CloudFolder provides that abstraction directly.
+
+## Sync tools vs CloudFolder
+
+Sync model:
+
+```text
+local copy  ⇄  remote copy
+```
+
+CloudFolder model:
+
+```text
+local filesystem view  →  remote source of truth
+```
+
+The trade-off is explicit: **CloudFolder is a live remote filesystem, not an offline mirror.**
+
+---
+
+# WinFsp is not a competitor, and rclone is not something CloudFolder replaces
+
+```text
+CloudFolder product / workflow layer
+              │
+        ┌─────┴─────┐
+        │           │
+      rclone      WinFsp
+        │           │
+      SFTP      Windows FS bridge
+```
+
+- **WinFsp** provides Windows userspace-filesystem infrastructure.
+- **rclone** provides the remote-storage / VFS mount engine.
+- **CloudFolder** provides installation, configuration, security, lifecycle, recovery, developer CLI, agent guidance, and the file/execution consistency layer.
+
+The project deliberately composes mature components instead of inventing a new SSH stack.
+
+---
+
+# Who benefits most?
+
+## Local Claude Code / Codex + remote GPU server
+
+Keep the local machine's agent login, Skills, MCP, browser/GitHub context, and desktop tools. Keep CUDA, datasets, Docker, and Linux dependencies on the server.
+
+## Developers working across many servers
+
+```text
+C:\Users\Alice\CloudFolder\
+├── Lab-A
+├── Lab-B
+├── GPU-4090
+├── GPU-H100
+└── Aliyun
+```
+
+Each server becomes a workspace root rather than a separate remote-agent installation project.
+
+## Research / robotics / ML
+
+A common setup is Windows for the daily desktop and Linux for GPU compute, simulators, datasets, and experiments. CloudFolder is designed around that **local interaction + remote compute** split.
+
+## Teams that do not want every server to become a full developer desktop
+
+The server keeps doing what it is good at:
+
+```text
+sshd + Linux toolchain + compute/data
+```
+
+No CloudFolder daemon is required remotely.
+
+---
+
+# Install in three steps
+
+1. Open the latest [GitHub Release](https://github.com/EurekaZang/CloudFolder/releases) and download `CloudFolder-windows-x64.zip`.
+2. Extract it.
+3. Double-click **`Install CloudFolder.cmd`**.
+
+Setup requests elevation once and installs the CloudFolder runtime, WinFsp, and rclone.
+
+It then asks for normal SSH information:
+
+- friendly name, e.g. `Lab Server`;
+- hostname or IP;
+- SSH port, default `22`;
+- SSH username;
+- remote directory, blank for the SSH user's home;
+- local Windows directory, with a sensible default.
+
+If the server does not yet trust the CloudFolder key:
+
+1. Windows OpenSSH displays the host fingerprint.
+2. You confirm the host.
+3. OpenSSH asks for the SSH password once.
+4. CloudFolder installs the public key.
+5. Mount services use key authentication afterward.
+
+**CloudFolder does not capture or store the SSH password.**
+
+No CloudFolder binary is installed on the server.
+
+### PowerShell bootstrap
+
+```powershell
+iwr https://raw.githubusercontent.com/EurekaZang/CloudFolder/main/install.ps1 -OutFile "$env:TEMP\install-cloudfolder.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\install-cloudfolder.ps1"
+```
+
+The bootstrap reads the latest GitHub Release, downloads the ZIP and SHA-256 file, verifies the package, and starts the same elevated installer.
+
+After setup, use:
+
+```text
+Start Menu → CloudFolder → CloudFolder Manager
+```
+
+or open a new terminal and use `cf`.
+
+---
+
+# `cf.exe` reference
+
+```text
+cf list
+cf path <mount>
+cf here
+cf status [mount]
+cf flush [mount]
+cf refresh [mount]
+cf run [mount] -- <program> [args...]
+cf sh [mount] -- <shell command>
+cf shell [mount]
+cf agent setup|status|remove
+```
+
+### `cf list`
+
+List configured mounts.
+
+### `cf path <mount>`
+
+Print a mount's Windows path, useful from PowerShell:
+
+```powershell
+cd (cf path Lab)
+```
+
+### `cf here`
+
+Resolve the current mount, local root/cwd, and matching remote cwd.
+
+### `cf status [mount]`
+
+Show service state, mount state, pending writes, local root, and remote root.
+
+### `cf flush [mount]`
+
+Wait until VFS queued/in-progress writes are zero.
+
+### `cf refresh [mount]`
+
+Invalidate the VFS directory view.
+
+### `cf run [mount] -- <program> [args...]`
+
+Use for a program + native argv without shell parsing:
+
+```powershell
+cf run -- git status
+cf run -- pytest -q
+cf run -- python scripts/train.py --config configs/a.yaml
+```
+
+Flow:
+
+```text
+flush → map cwd → strict SSH → exec argv → preserve exit code → refresh
+```
+
+### `cf sh [mount] -- <shell command>`
+
+Use when shell operators, pipelines, redirects, or variables are needed:
+
+```powershell
+cf sh -- "git status && pytest -q"
+cf sh -- "rg TODO src | head -50"
+```
+
+### `cf shell [mount]`
+
+Open an interactive remote login shell in the mapped remote cwd.
+
+You may specify the mount explicitly when outside a mounted directory:
+
+```powershell
+cf run Lab -- git status
+cf shell Lab
+```
+
+---
+
+# Teach Claude Code / Codex once
+
+```powershell
+cf agent setup
+```
+
+CloudFolder updates only its managed block in:
+
+```text
+%USERPROFILE%\.claude\CLAUDE.md
+%USERPROFILE%\.codex\AGENTS.md
+```
+
+It teaches the agents to:
+
+- edit through normal local filesystem tools;
+- use `cf here` to detect a CloudFolder workspace;
+- use `cf run` for Git/build/test/package managers/compilers/interpreters;
+- prefer remote `rg` / `find` for cold repository-wide scans;
+- use `cf sh` for shell syntax;
+- avoid launching a second remote coding agent solely for this workspace.
+
+This is explicitly opt-in. Existing instructions are preserved.
+
+```powershell
+cf agent status
+cf agent remove
+```
+
+---
+
+# Architecture: three planes, one workspace
+
+```mermaid
+flowchart LR
+    A[Claude Code / Codex / VS Code / Explorer]
+    P[Windows CloudFolder Path]
+    W[WinFsp]
+    R[rclone VFS]
+    S[SFTP]
+    L[Remote Linux Files]
+    C[cf.exe]
+    SSH[Windows OpenSSH]
+    T[Remote Linux Toolchain]
+    SV[CloudFolderService.exe]
+
+    A -->|normal file I/O| P
+    P --> W --> R --> S --> L
+    A -->|Git / test / build| C
+    C -->|flush + cwd mapping| SSH --> T
+    SV -. supervise / health / recover .-> R
+    C -. refresh VFS .-> R
+```
+
+```text
+Data plane:       Windows path → WinFsp → rclone VFS → SFTP → remote files
+Execution plane:  local cwd → cf.exe → SSH → matching Linux cwd
+Control plane:    CloudFolderService → health / restart / backoff / cleanup
+Agent plane:      Claude/Codex guidance → choose local I/O or remote execution
+```
+
+---
+
+# Reliability layer
+
+Current mount supervision includes:
+
+- one Windows Service per mount for fault isolation;
+- child-process liveness checks;
+- a separate killable filesystem health probe so a hung filesystem call cannot hang the watchdog itself;
+- automatic rclone replacement after abnormal exit;
 - bounded exponential reconnect backoff with jitter;
-- Windows SCM recovery if the supervisor itself is killed;
-- a Windows **Job Object with `KILL_ON_JOB_CLOSE`**, preventing orphaned mount processes;
+- Windows SCM recovery;
+- Windows **Job Object + `KILL_ON_JOB_CLOSE`** to prevent orphan rclone processes;
 - graceful rclone RC shutdown with PID verification;
 - stale reparse-point cleanup;
-- refusal to hide or overwrite a non-empty normal directory at the mount path;
-- independent RC port, cache, and logs for every mount;
+- refusal to hide/overwrite a non-empty normal directory at the mount path;
+- independent RC port, cache, and logs per mount;
 - bounded VFS cache and minimum-free-space protection;
-- strict SSH `known_hosts` verification;
-- host-key algorithm pinning based on what Windows OpenSSH actually negotiated;
-- safe runtime upgrades that stop and restore all CloudFolder mount services around the shared binary update.
+- safe stop/upgrade/restore around shared runtime upgrades.
 
-## Architecture
+> **A mount should exist as infrastructure, not merely be running in somebody's terminal.**
+
+---
+
+# Default Dev profile
+
+- Local root: `%USERPROFILE%\CloudFolder\<name>`
+- Dedicated key: `%USERPROFILE%\.ssh\cloudfolder_ed25519`
+- Backend: SFTP
+- VFS cache mode: `full`
+- Cache maximum: `8 GiB`
+- Minimum free space: `5 GiB`
+- Developer write-back: `1s`
+- `cf run`: explicit flush barrier still applies
+- Concurrent VFS uploads: `8`
+- Health probe: every `10s`
+- Probe timeout: `5s`
+- Recycle after 3 consecutive probe failures
+- rclone idle SFTP connection: `20s`
+- Windows Service startup: Automatic (Delayed)
+
+Advanced users can edit generated configuration under:
 
 ```text
-Claude Code / Codex / VS Code / Explorer
-                 │
-                 ├──── normal file I/O ────┐
-                 │                          ▼
-                 │                    Windows path
-                 │                          │
-                 │                        WinFsp
-                 │                          │
-                 │                     rclone VFS
-                 │                          │
-                 │                        SFTP
-                 │                          │
-                 │                          ▼
-                 └── cf run / cf sh ── SSH ──► Linux workspace
-
-CloudFolderService.exe supervises every rclone mount:
-health probes → crash recovery → backoff → logs → safe cleanup → SCM recovery
-
-cf.exe supplies the terminal bridge:
-flush pending writes → map cwd → execute remotely → preserve exit code → refresh local view
+C:\ProgramData\CloudFolder\mounts\<name>\
 ```
 
-CloudFolder does **not** replace WinFsp or rclone. WinFsp provides the Windows userspace-filesystem bridge, rclone provides the SFTP/VFS mount engine, and CloudFolder makes the combination persistent, self-healing, and manageable.
+and restart the matching `CloudFolder.<name>` service.
 
-## CloudFolder Manager
+---
+
+# Security model
+
+## Host verification
+
+Before installing the public key, Windows OpenSSH shows the server fingerprint. Later connections use strict host checking and the mount's explicit `known_hosts` metadata.
+
+`cf run`, `cf sh`, and `cf shell` use the same strict SSH identity information.
+
+## Password handling
+
+The SSH password may be entered once directly into Windows OpenSSH while authorizing the key. CloudFolder does not write the password into rclone config, TOML, logs, environment variables, or command-line arguments.
+
+## Unattended key trade-off
+
+A Windows Service cannot type an interactive private-key passphrase after every reboot. CloudFolder therefore creates a dedicated **unencrypted SSH private key** by default and protects it with Windows ACLs.
+
+This is an explicit reliability/security trade-off rather than hidden behavior.
+
+## Windows filesystem ACL
+
+Mount services run as LocalSystem for reliable startup and SCM recovery. CloudFolder generates per-user WinFsp `FileSecurity` so the installing user's SID is filesystem owner with FullControl; LocalSystem and Administrators retain FullControl. It does not grant Everyone FullControl.
+
+See [SECURITY.md](SECURITY.md).
+
+---
+
+# Performance: do not pretend a network filesystem is local NVMe
+
+CloudFolder deliberately does **not** promise local-NTFS latency for every workload.
+
+SFTP round trips, server latency, directory size, file count, and VFS cache state still matter.
+
+Git is a useful example: it performs many small metadata/object accesses under `.git`, so a cold mounted repository can amplify network round trips.
+
+CloudFolder's performance model is therefore:
+
+```text
+low fan-out / editing I/O  → local filesystem path
+high fan-out / compute     → remote execution
+```
+
+That is why `cf run` is a core feature rather than an SSH shortcut added on the side.
+
+---
+
+# CloudFolder Manager
 
 The interactive manager intentionally stays small:
 
@@ -178,80 +701,135 @@ The interactive manager intentionally stays small:
 7. Exit
 ```
 
-Removing a CloudFolder mount removes the **local mount and service configuration only**. It does not delete remote files. The local VFS cache is preserved by default because, after a network failure, it may be the last place containing an uncommitted write. `Uninstall -PurgeCache` explicitly removes CloudFolder cache roots.
+Removing a mount removes the local mount/service configuration, **not remote files**.
 
-## Defaults for normal users
+The VFS cache is preserved by default because after a network failure it may still contain the last copy of a write that has not reached the server. Cache roots are removed only with explicit purge behavior such as `Uninstall -PurgeCache`.
 
-- Local folder: `%USERPROFILE%\CloudFolder\<name>`
-- Dedicated key: `%USERPROFILE%\.ssh\cloudfolder_ed25519`
-- Authentication: SSH public key; SSH passwords are never stored
-- VFS cache: `full`, maximum `8 GiB`
-- Minimum free space: `5 GiB`
-- New mount profile: `Dev`
-- Developer write-back delay: `1s`; `cf run` still uses an explicit flush barrier before remote execution
-- Concurrent VFS uploads: `8`
-- Windows filesystem ACL: the installing user's SID is the filesystem owner with FullControl; LocalSystem and Administrators also retain FullControl
-- Health probe: every `10s`, `5s` timeout, recycle after 3 consecutive failures
-- rclone idle SFTP connections: `20s`
-- Windows service startup: automatic (delayed)
+---
 
-Advanced users can edit the generated TOML/INI files under `C:\ProgramData\CloudFolder\mounts\<name>\` and restart the corresponding `CloudFolder.<name>` service.
+# Troubleshooting
 
-## Security model
+Open:
 
-An unattended Windows service cannot type a key passphrase after every reboot. CloudFolder therefore creates a dedicated **unencrypted SSH private key** by default and protects it with Windows ACLs. LocalSystem receives read access because it runs the mount service.
+```text
+CloudFolder Manager → Doctor / troubleshoot
+```
 
-Mount services themselves run as LocalSystem for reliability. To avoid the normal-user permission and Git-ownership problems that a SYSTEM-owned WinFsp filesystem would otherwise create, CloudFolder generates a per-user WinFsp `FileSecurity` descriptor: the installing Windows SID becomes the filesystem owner with FullControl, while SYSTEM and Administrators retain FullControl. It does **not** grant Everyone full access.
+Doctor checks:
 
-The public key is installed on the server only after Windows OpenSSH presents the host fingerprint. `known_hosts` verification remains strict for all later connections. CloudFolder never writes an SSH password into rclone configuration, TOML, logs, environment variables, or command-line arguments.
-
-See [SECURITY.md](SECURITY.md) for details.
-
-## Limitations
-
-- The beginner-friendly manager currently configures **SFTP** mounts. rclone supports many other backends, but exposing them safely in the simple UI is future work.
-- CloudFolder is a live remote filesystem, **not an offline-sync mirror**. Network latency and server performance still matter.
-- Direct local Git operations and cold repository-wide scans can be slow over SFTP. Prefer `cf run -- git ...`, `cf run -- rg ...`, builds, tests, package managers and similar high-fan-out workloads on the remote Linux host.
-- POSIX permissions, ownership, and symlink identity cannot always map perfectly onto Windows filesystem semantics.
-- Exact Linux symlink semantics are not preserved as native Windows symlinks by the current rclone SFTP projection.
-- Releases are currently **not Authenticode code-signed**, so Windows SmartScreen may show an unknown-publisher warning. A SHA-256 checksum is published next to every Release ZIP.
-
-## Troubleshooting
-
-Open **CloudFolder Manager → Doctor / troubleshoot**. Doctor checks:
-
-- the CloudFolder service engine;
+- CloudFolder service engine;
 - rclone;
 - WinFsp;
 - Windows OpenSSH;
-- every configured Windows Service;
-- every local mount point;
-- fresh strict SFTP connectivity for each mount.
+- configured Windows Services;
+- local mount points;
+- fresh strict SFTP connectivity.
 
-Logs are stored under:
+Logs:
 
 ```text
 C:\ProgramData\CloudFolder\logs\
 ```
 
-## For developers
+Useful CLI diagnostics:
+
+```powershell
+cf status
+cf here
+cf flush
+cf refresh
+```
+
+---
+
+# Current boundaries
+
+CloudFolder keeps its scope intentionally narrow today.
+
+- The beginner-friendly manager currently focuses on **SFTP**. rclone supports many more backends, but they are not all exposed in the simple UI.
+- CloudFolder is a **live remote filesystem**, not an offline synchronization mirror.
+- Network and server latency still exist.
+- Git, package managers, and cold repository-wide scans can be slow directly on the mount; prefer `cf run`.
+- POSIX permissions/ownership cannot always map perfectly to Windows filesystem semantics.
+- The current rclone SFTP projection does not preserve Linux symlink identity as native Windows symlinks.
+- Releases are currently **not Authenticode-signed**, so Windows SmartScreen may show an unknown-publisher warning. SHA-256 checksum files are released with the ZIP.
+- The current product target is Windows local-agent → Linux SSH/SFTP workspace; macOS/Linux clients are not the focus of this release line.
+
+These limitations are documented because the goal is a reliable specific workflow, not an inflated feature checklist.
+
+---
+
+# FAQ
+
+### Does CloudFolder sync a complete copy of the repository to Windows?
+
+No. The Windows path is a live view of the remote filesystem. rclone VFS uses local caching to provide filesystem behavior, but CloudFolder is not a conventional full-project sync mirror.
+
+### Does the server need root or a CloudFolder daemon?
+
+No CloudFolder daemon is installed remotely. A normal SSH/SFTP account with permission to the target directory is enough. Initial public-key authorization requires the account to be able to use its SSH authorized-keys environment normally.
+
+### Why not run local `git status` on the mount?
+
+You can, but metadata-heavy Git access can be slow on a cold network filesystem. Prefer:
+
+```powershell
+cf run -- git status
+```
+
+### Can `cf run` miss a file I just saved?
+
+It waits for VFS queued/in-progress writes to drain before starting remote execution. That is part of the Workspace Consistency Contract.
+
+### What if a remote command creates files and I cannot see them locally yet?
+
+`cf run` refreshes the VFS view after execution. You can also run:
+
+```powershell
+cf refresh
+```
+
+### Is an AI agent required?
+
+No. CloudFolder is also a normal Windows remote-workspace layer for VS Code, Explorer, and other local programs.
+
+### Can I mount multiple servers?
+
+Yes. Each mount has independent service configuration, cache, RC endpoint, and logs.
+
+### Is CloudFolder an SSHFS-Win fork?
+
+No. The current filesystem engine uses rclone SFTP + WinFsp. CloudFolder owns the product/workflow layer around them.
+
+---
+
+# For developers
 
 End users do **not** need Rust.
 
-To build from source on Windows:
+Build on Windows:
 
 ```powershell
 .\scripts\build.ps1
 ```
 
-The local build script uses the Windows GNU Rust target and an ASCII-only Cargo target directory, so it also works when the repository path contains Unicode characters. GitHub Actions builds Release binaries on `windows-latest` with the standard MSVC toolchain.
+CI runs:
 
-Useful validation commands:
+```text
+cargo fmt -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+PowerShell 5.1 parser checks
+```
+
+A `v*` tag runs tests, builds `CloudFolderService.exe` and `cf.exe`, packages the three READMEs, creates `CloudFolder-windows-x64.zip` plus SHA-256, and publishes a GitHub Release.
+
+Validation scripts:
 
 ```powershell
 .\scripts\smoke-test.ps1 -MountPoint 'C:\Users\Alice\CloudFolder\Lab Server'
 
-# Destructive resilience test. Run elevated and only against a disposable test mount.
+# Destructive resilience test: elevated, disposable test mount only.
 .\scripts\fault-test.ps1 `
   -ServiceName 'CloudFolder.lab-server' `
   -MountPoint 'C:\Users\Alice\CloudFolder\Lab Server' `
@@ -260,15 +838,47 @@ Useful validation commands:
   -RcPort 55770
 ```
 
-CI runs Rust formatting, tests, Clippy, and Windows PowerShell 5.1 parser checks. A `v*` tag automatically builds `CloudFolder-windows-x64.zip` and publishes it as a GitHub Release.
+---
 
-## Credits
+# The one-sentence version
 
-CloudFolder stands on excellent existing projects:
+> **CloudFolder turns a server into a local folder, keeps the Agent local, and sends commands back to the server.**
 
-- [rclone](https://rclone.org/) — remote storage and VFS mount engine;
+If every new Linux server currently means:
+
+```text
+SSH in
+→ install another agent
+→ configure login again
+→ configure Skills/MCP again
+→ rebuild the interactive environment again
+```
+
+CloudFolder is designed to remove that repeated layer.
+
+**One local agent. Many remote workspaces.**
+
+If this workflow is useful, try the Release, Star the repository, and report real failure cases in Issues. Reliability matters more than adding another checkbox.
+
+---
+
+# Credits
+
+CloudFolder builds on excellent projects:
+
+- [rclone](https://rclone.org/) — remote storage / VFS mount engine;
 - [WinFsp](https://winfsp.dev/) — Windows userspace filesystem infrastructure;
 - [windows-service](https://crates.io/crates/windows-service) — Rust Windows Service integration.
+
+Official references used in the comparison above:
+
+- [SSHFS-Win](https://github.com/winfsp/sshfs-win)
+- [rclone mount](https://rclone.org/commands/rclone_mount/)
+- [VS Code Remote - SSH](https://code.visualstudio.com/docs/remote/ssh)
+- [WinSCP Synchronization](https://winscp.net/eng/docs/task_synchronize)
+- [RaiDrive](https://docs.raidrive.com/en/)
+- [ExpanDrive SFTP](https://docs.expandrive.com/integrations/sftp)
+- [Mountain Duck](https://docs.cyberduck.io/mountainduck/)
 
 ## License
 
