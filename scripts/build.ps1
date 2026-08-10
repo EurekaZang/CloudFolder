@@ -22,7 +22,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit code $LASTEXITCODE" }
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
     Copy-Item (Join-Path $TargetDir 'release\CloudFolderService.exe') (Join-Path $DistDir 'CloudFolderService.exe') -Force
+    Copy-Item (Join-Path $TargetDir 'release\cf.exe') (Join-Path $DistDir 'cf.exe') -Force
     Write-Host "Built: $(Join-Path $DistDir 'CloudFolderService.exe')"
+    Write-Host "Built: $(Join-Path $DistDir 'cf.exe')"
 } finally {
     Pop-Location
 }

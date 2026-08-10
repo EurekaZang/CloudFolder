@@ -32,11 +32,15 @@ jobs:
           $stage = Join-Path $PWD 'release-stage'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item '.\target\release\CloudFolderService.exe' $stage
+          Copy-Item '.\target\release\cf.exe' $stage
           Copy-Item '.\CloudFolder.ps1' $stage
+          Copy-Item '.\cf.ps1' $stage
           Copy-Item '.\Install CloudFolder.cmd' $stage
           Copy-Item '.\CloudFolder Manager.cmd' $stage
           Copy-Item '.\Uninstall CloudFolder.cmd' $stage
           Copy-Item '.\README.md' $stage
+          Copy-Item '.\README.en.md' $stage
+          Copy-Item '.\README.ja.md' $stage
           Copy-Item '.\LICENSE' $stage
           Compress-Archive -Path "$stage\*" -DestinationPath '.\CloudFolder-windows-x64.zip' -Force
           $hash = (Get-FileHash '.\CloudFolder-windows-x64.zip' -Algorithm SHA256).Hash.ToLowerInvariant()

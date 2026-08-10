@@ -2,11 +2,66 @@
 
 **[中文](README.md) | [English](README.en.md) | [日本語](README.ja.md)**
 
-**リモートの Linux / SFTP ディレクトリを通常の Windows フォルダーとしてマウントし、自動的に接続を維持します。**
+**リモート Linux ワークスペースをローカル Windows に。コーディング Agent はローカルに置いたまま、実行環境はリモートに残せます。**
 
-CloudFolder は、SSH/SFTP 上のリモートディレクトリを、エクスプローラー、VS Code、Python、Git ツールなどの一般的な Windows アプリからそのまま使えるローカルパスとして提供します。内部では **rclone + WinFsp** を利用し、軽量な Rust 製 Windows Service がヘルスチェック、クラッシュ復旧、安全なクリーンアップ、複数マウントの分離管理を担当します。
+CloudFolder は、SSH/SFTP 上のリモートワークスペースを、エクスプローラー、VS Code、Claude Code、Codex などのローカル Windows アプリからそのまま使える通常のパスとして提供します。ファイル自体はリモートサーバーに置いたまま、ローカル Agent が Windows 上から読み書きできるため、サーバーごとに Claude Code や Codex を再デプロイする必要はありません。
+
+ファイルシステム層には **rclone + WinFsp** を使用し、軽量な Rust 製 Windows Service が各マウントを常時維持します。さらにネイティブの **`cf.exe`** CLI が、ローカルの現在ディレクトリに対応するリモート Linux ディレクトリへターミナルコマンドを橋渡しします。
 
 > 現在の初心者向けインストーラー対象：**Windows 10/11 x64 + SSH/SFTP サーバー**。
+
+## 中心ワークフロー：ローカル Agent + リモート Linux
+
+推奨する開発フローは次のとおりです。
+
+```powershell
+cd (cf path lab)
+
+# Agent 本体は Windows 上で動かします。
+claude
+# または: codex
+
+# ファイルはローカルのマウント経由で編集し、
+# Git / テスト / ビルドなどは対応するリモート cwd で実行します。
+cf here
+cf run -- git status
+cf run -- pytest -q
+cf run -- cargo test
+cf sh -- "git status && pytest -q"
+```
+
+`cf run` は単なる SSH の別名ではありません。実行前に VFS の未送信書き込みがサーバーへ到達するまで待機し、現在の Windows サブディレクトリを対応する絶対 Linux パスへ正確に変換します。その場所で strict SSH host verification を使ってコマンドを実行し、リモートの終了コードをそのまま返し、最後にローカルのディレクトリキャッシュを更新します。
+
+CloudFolder では意図的に作業を次の 2 種類へ分けます。
+
+- **ローカル Windows パス：** エディタ / Agent によるファイルの読み取り、限定的な検索、編集、作成、名前変更、削除。
+- **`cf run` 経由のリモート Linux：** Git、テスト、ビルド、コンパイラ、パッケージマネージャー、プロジェクトのインタプリタ、そして大量の小さなファイルへ触れるリポジトリ全体の処理。
+
+冷たい SFTP マウント上の `.git` に対してローカルで `git status` を実行すると、Git が metadata/object へ大量の小さなランダムアクセスを行うため遅くなることがあります。CloudFolder はこの負荷まで NTFS と同じ遅延で動くとは扱わず、リモート実行そのものをワークスペースの第一級機能として提供します。
+
+### Claude Code / Codex に CloudFolder の使い方を教える
+
+CloudFolder は、両 Agent に対して小さな**条件付きユーザーレベル指示ブロック**を明示的に追加できます。
+
+```powershell
+cf agent setup
+```
+
+CloudFolder が管理するのは、次のファイル内の managed block だけです。
+
+```text
+%USERPROFILE%\.claude\CLAUDE.md
+%USERPROFILE%\.codex\AGENTS.md
+```
+
+既存の指示は保持されます。CloudFolder のブロックは、CloudFolder ワークスペースでは通常のローカルファイルツールで編集しつつ、Git、ビルド、テスト、大規模なリポジトリ検索は `cf run` / `cf sh` でリモート実行するよう Agent に伝えます。この設定は **opt-in** であり、通常の CloudFolder インストールだけで Agent の設定を自動変更することはありません。
+
+状態確認と削除はいつでも行えます。
+
+```powershell
+cf agent status
+cf agent remove
+```
 
 ## 3 ステップでインストール
 
@@ -25,7 +80,7 @@ CloudFolder はランタイム、WinFsp、rclone を自動で導入します。�
 
 サーバー側がまだ CloudFolder の公開鍵を信頼していない場合、Windows OpenSSH が最初にサーバーのフィンガープリントを表示し、その後 **1 回だけ** SSH パスワードの入力を求めます。パスワードは OpenSSH が直接読み取り、CloudFolder は取得も保存もしません。それ以降、Windows Service は公開鍵認証のみを使用します。
 
-インストール後は、**スタートメニュー → CloudFolder → CloudFolder Manager** から、マウントの追加、オープン、再起動、診断、削除を行えます。
+インストール後は、**スタートメニュー → CloudFolder → CloudFolder Manager** から、マウントの追加、オープン、再起動、診断、削除を行えます。新しく開いたターミナルでは、ネイティブの `cf` コマンドも直接利用できます。
 
 ### PowerShell からオンラインインストール
 
@@ -85,23 +140,26 @@ CloudFolder は、そのライフサイクルと信頼性の層を追加しま�
 ## アーキテクチャ
 
 ```text
-エクスプローラー / VS Code / Python / 一般的な Windows アプリ
-                     │
-                     ▼
-                 Windows パス
-                     │
-                  WinFsp
-                     │
-                     ▼
-               rclone mount
-                     │
-                  SFTP/SSH
-                     │
-                     ▼
-                Linux サーバー
+Claude Code / Codex / VS Code / エクスプローラー
+                 │
+                 ├──── 通常のファイル I/O ────┐
+                 │                              ▼
+                 │                         Windows パス
+                 │                              │
+                 │                            WinFsp
+                 │                              │
+                 │                         rclone VFS
+                 │                              │
+                 │                            SFTP
+                 │                              │
+                 │                              ▼
+                 └── cf run / cf sh ── SSH ──► Linux ワークスペース
 
-CloudFolderService.exe が各 rclone mount を横から監視します：
+CloudFolderService.exe が各 rclone mount を監視します：
 ヘルスプローブ → クラッシュ復旧 → バックオフ → ログ → 安全なクリーンアップ → SCM 復旧
+
+cf.exe がターミナルを橋渡しします：
+未送信書き込みを flush → cwd を変換 → リモート実行 → 終了コードを保持 → ローカル表示を更新
 ```
 
 CloudFolder は WinFsp や rclone を置き換えるものではありません。WinFsp が Windows のユーザー空間ファイルシステム橋渡しを提供し、rclone が SFTP/VFS マウントエンジンを担当し、CloudFolder がその組み合わせを常駐・自己復旧・管理可能にします。
@@ -129,7 +187,10 @@ CloudFolder のマウントを削除しても、削除されるのは**ローカ
 - 認証：SSH 公開鍵。SSH パスワードは保存しません
 - VFS キャッシュ：`full`、最大 `8 GiB`
 - 最低空き容量：`5 GiB`
-- write-back 遅延：`5s`
+- 新規マウントの既定 profile：`Dev`
+- 開発モードの write-back 遅延：`1s`。ただし `cf run` はリモート実行前に明示的な flush barrier を使用します
+- VFS 同時アップロード数：`8`
+- Windows ファイルシステム ACL：CloudFolder をインストールした Windows ユーザー SID が filesystem owner となり FullControl を持ちます。LocalSystem と Administrators も FullControl を保持します
 - ヘルスプローブ：`10s` ごと、タイムアウト `5s`、3 回連続失敗でマウントを再生成
 - rclone のアイドル SFTP 接続：`20s`
 - Windows Service：自動起動（遅延開始）
@@ -140,6 +201,8 @@ CloudFolder のマウントを削除しても、削除されるのは**ローカ
 
 無人運用の Windows Service は、再起動のたびに SSH 鍵のパスフレーズを対話的に入力できません。そのため CloudFolder は既定で専用の**パスフレーズなし SSH 秘密鍵**を作成し、Windows ACL でアクセスを保護します。マウントサービスを実行する LocalSystem には読み取り権限が与えられます。
 
+マウントサービス自体は、自動起動・自己修復・SCM recovery のため LocalSystem として実行されます。一方、SYSTEM-owned の WinFsp ファイルシステムでは通常ユーザーの書き込みや Git の ownership 判定に問題が起きるため、CloudFolder はインストールしたユーザー SID に合わせた WinFsp `FileSecurity` を生成します。そのユーザーが filesystem owner と FullControl を持ち、SYSTEM と Administrators も FullControl を保持します。簡単に済ませるために Everyone へ FullControl を与えることはありません。
+
 公開鍵は、Windows OpenSSH がサーバーのフィンガープリントを表示して確認された後にのみサーバーへ登録されます。それ以降も `known_hosts` の検証は厳格に行われます。CloudFolder は SSH パスワードを rclone 設定、TOML、ログ、環境変数、コマンドライン引数へ書き込みません。
 
 詳細は [SECURITY.md](SECURITY.md) を参照してください。
@@ -148,6 +211,7 @@ CloudFolder のマウントを削除しても、削除されるのは**ローカ
 
 - 初心者向けマネージャーで現在設定できるのは **SFTP** マウントです。rclone 自体は多数のバックエンドに対応していますが、安全かつ簡単な UI への公開は今後の課題です。
 - CloudFolder はリアルタイムのリモートファイルシステムであり、**オフライン同期ミラーではありません**。遅延や速度はネットワークとサーバー性能に依存します。
+- SFTP マウント上でのローカル Git 操作や、コールドキャッシュ状態で大量の小さなファイルを読むリポジトリ全体のスキャンは遅くなる場合があります。Git、全体検索、ビルド、テスト、パッケージマネージャーなどの高 fan-out 処理は `cf run -- git ...`、`cf run -- rg ...` などでリモート Linux 上から実行することを推奨します。
 - POSIX の権限、所有者、symlink の意味を Windows ファイルシステムへ完全に対応させられない場合があります。
 - 現在の rclone SFTP 投影では、Linux symlink の厳密な意味は Windows ネイティブ symlink として保持されません。
 - 現在の Release は **Authenticode 署名されていません**。そのため Windows SmartScreen が「不明な発行元」を表示する場合があります。各 Release ZIP には SHA-256 チェックサムも公開されます。

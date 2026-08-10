@@ -249,7 +249,13 @@ fn start_mount(cfg: &Config, child_job: &KillOnCloseJob) -> Result<Child> {
         .arg("--vfs-read-ahead")
         .arg(&cfg.mount.vfs_read_ahead)
         .arg("--vfs-cache-poll-interval")
-        .arg("30s")
+        .arg(&cfg.mount.vfs_cache_poll_interval)
+        .arg("--transfers")
+        .arg(cfg.mount.transfers.to_string())
+        .arg("--file-perms")
+        .arg(&cfg.mount.file_perms)
+        .arg("--dir-perms")
+        .arg(&cfg.mount.dir_perms)
         .arg("--contimeout")
         .arg("10s")
         .arg("--timeout")
@@ -272,6 +278,11 @@ fn start_mount(cfg: &Config, child_job: &KillOnCloseJob) -> Result<Child> {
         .arg("--log-format")
         .arg("date,time,microseconds,pid")
         .arg("--no-console");
+    if !cfg.mount.windows_file_security.trim().is_empty() {
+        command
+            .arg("-o")
+            .arg(format!("FileSecurity={}", cfg.mount.windows_file_security));
+    }
     if cfg.mount.read_only {
         command.arg("--read-only");
     }

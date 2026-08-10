@@ -14,6 +14,11 @@ dir_cache_time = "30s"
 attr_timeout = "1s"
 buffer_size = "16Mi"
 vfs_read_ahead = "64Mi"
+vfs_cache_poll_interval = "2s"
+transfers = 8
+file_perms = "0777"
+dir_perms = "0777"
+windows_file_security = ""
 read_only = false
 rc_addr = "127.0.0.1:55770"
 

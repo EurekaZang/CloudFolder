@@ -40,6 +40,16 @@ pub struct MountConfig {
     pub buffer_size: String,
     #[serde(default = "default_read_ahead")]
     pub vfs_read_ahead: String,
+    #[serde(default = "default_cache_poll_interval")]
+    pub vfs_cache_poll_interval: String,
+    #[serde(default = "default_transfers")]
+    pub transfers: u32,
+    #[serde(default = "default_file_perms")]
+    pub file_perms: String,
+    #[serde(default = "default_dir_perms")]
+    pub dir_perms: String,
+    #[serde(default)]
+    pub windows_file_security: String,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default = "default_rc_addr")]
@@ -143,6 +153,25 @@ impl Config {
         if self.mount.mount_point == self.mount.cache_dir {
             bail!("mount.mount_point and mount.cache_dir must be different paths");
         }
+        if self.mount.transfers == 0 {
+            bail!("mount.transfers must be > 0");
+        }
+        for (label, value) in [
+            ("mount.file_perms", self.mount.file_perms.as_str()),
+            ("mount.dir_perms", self.mount.dir_perms.as_str()),
+        ] {
+            if value.len() != 4
+                || !value.starts_with('0')
+                || !value.chars().all(|c| c.is_ascii_digit() && c < '8')
+            {
+                bail!("{label} must be an octal mode such as 0666 or 0777");
+            }
+        }
+        if self.mount.windows_file_security.contains('\r')
+            || self.mount.windows_file_security.contains('\n')
+        {
+            bail!("mount.windows_file_security cannot contain line breaks");
+        }
         Ok(())
     }
 
@@ -180,6 +209,18 @@ fn default_buffer_size() -> String {
 }
 fn default_read_ahead() -> String {
     "64Mi".into()
+}
+fn default_cache_poll_interval() -> String {
+    "30s".into()
+}
+fn default_transfers() -> u32 {
+    4
+}
+fn default_file_perms() -> String {
+    "0666".into()
+}
+fn default_dir_perms() -> String {
+    "0777".into()
 }
 fn default_rc_addr() -> String {
     "127.0.0.1:5577".into()
@@ -246,5 +287,24 @@ rc_addr = "0.0.0.0:5577"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn developer_mount_options_validate() {
+        let text = r#"
+[mount]
+rclone_exe = "C:\\rclone.exe"
+rclone_config = "C:\\rclone.conf"
+remote = "x:/"
+mount_point = "C:\\CloudFolder\\Example"
+cache_dir = "C:\\.CloudFolderCache\\Example"
+vfs_cache_mode = "writes"
+vfs_cache_poll_interval = "2s"
+transfers = 8
+file_perms = "0777"
+dir_perms = "0777"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }

@@ -9,6 +9,8 @@ param(
     [string]$RemotePath,
     [string]$MountPoint,
     [string]$KeyFile,
+    [ValidateSet('Dev','Balanced')]
+    [string]$Profile = 'Dev',
     [switch]$ReadOnly,
     [switch]$SkipKeyAuthorization,
     [switch]$SkipAdd,
@@ -91,6 +93,18 @@ function Get-PayloadExe {
     throw 'CloudFolderService.exe is missing. Download the Windows release ZIP, or build the project first.'
 }
 
+function Get-PayloadCfExe {
+    $candidates = @(
+        (Join-Path $ScriptRoot 'cf.exe'),
+        (Join-Path $ScriptRoot 'dist\cf.exe'),
+        (Join-Path $ScriptRoot 'target\release\cf.exe')
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return (Resolve-Path $candidate).Path }
+    }
+    throw 'cf.exe is missing. Download the Windows release ZIP, or build the project first.'
+}
+
 function Assert-FileHash([string]$Path, [string]$Expected, [string]$Label) {
     $sha = [Security.Cryptography.SHA256]::Create()
     $stream = [IO.File]::OpenRead($Path)
@@ -140,6 +154,33 @@ function ConvertTo-SafeFolderName([string]$Value) {
     $safe = $safe.Trim().TrimEnd('.')
     if ([string]::IsNullOrWhiteSpace($safe)) { return 'Remote' }
     return $safe
+}
+
+function ConvertTo-PosixSingleQuoted([string]$Value) {
+    $single = [string][char]39
+    $replacement = $single + '\' + $single + $single
+    return $single + $Value.Replace($single, $replacement) + $single
+}
+
+function Ensure-CloudFolderOnPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $entries = @($machinePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $alreadyPresent = @($entries | Where-Object { $_.TrimEnd('\\') -ieq $InstallDir.TrimEnd('\\') }).Count -gt 0
+    if (-not $alreadyPresent) {
+        [Environment]::SetEnvironmentVariable('Path', (($entries + $InstallDir) -join ';'), 'Machine')
+    }
+    if (@(($env:Path -split ';') | Where-Object { $_.TrimEnd('\\') -ieq $InstallDir.TrimEnd('\\') }).Count -eq 0) {
+        $env:Path = $env:Path.TrimEnd(';') + ';' + $InstallDir
+    }
+}
+
+function Remove-CloudFolderFromPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ([string]::IsNullOrWhiteSpace($machinePath)) { return }
+    $entries = @($machinePath -split ';' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and $_.TrimEnd('\\') -ine $InstallDir.TrimEnd('\\')
+    })
+    [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'Machine')
 }
 
 function Get-MountRecords {
@@ -215,6 +256,18 @@ function Stop-CloudFolderService([string]$ServiceName, [int]$TimeoutSeconds = 30
     throw "$ServiceName did not stop within $TimeoutSeconds seconds."
 }
 
+function Wait-ServiceDeleted([string]$ServiceName, [int]$TimeoutSeconds = 20) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $serviceGone = -not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+        $registryGone = -not (Test-Path -LiteralPath $registryPath)
+        if ($serviceGone -and $registryGone) { return }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "Windows service '$ServiceName' is still registered after $TimeoutSeconds seconds. CloudFolder kept its metadata so removal can be retried safely."
+}
+
 function Wait-MountReady([object]$Record, [int]$TimeoutSeconds = 60) {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $logPath = [string]$Record.service_log
@@ -245,6 +298,64 @@ function Set-SecureDataAcl {
     if ($children) {
         & icacls.exe (Join-Path $DataDir '*') /reset /T /C | Out-Null
         Assert-NativeExit 'Resetting CloudFolder child ACLs'
+    }
+}
+
+function Upgrade-ExistingMounts {
+    if (-not (Test-Path -LiteralPath $MountsDir)) { return }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $userSid = $identity.User.Value
+    $fileSecurity = "O:${userSid}G:${userSid}D:P(A;;FA;;;$userSid)(A;;FA;;;SY)(A;;FA;;;BA)"
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+
+    Get-ChildItem -LiteralPath $MountsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $mountDir = $_.FullName
+        $metadataPath = Join-Path $mountDir 'mount.json'
+        if (-not (Test-Path -LiteralPath $metadataPath)) { return }
+
+        try {
+            $record = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+            $configPath = [string]$record.config_path
+            if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $mountDir 'service.toml' }
+
+            if (Test-Path -LiteralPath $configPath) {
+                $configText = Get-Content -LiteralPath $configPath -Raw
+                if ($configText -notmatch '(?m)^windows_file_security\s*=') {
+                    $securityLine = 'windows_file_security = "' + (ConvertTo-TomlString $fileSecurity) + '"'
+                    if ($configText -match '(?m)^read_only\s*=') {
+                        $configText = [regex]::Replace(
+                            $configText,
+                            '(?m)^(read_only\s*=)',
+                            ($securityLine + "`r`n`$1"),
+                            1
+                        )
+                    } else {
+                        $configText = $configText.TrimEnd() + "`r`n" + $securityLine + "`r`n"
+                    }
+                    [IO.File]::WriteAllText($configPath, $configText, $utf8NoBom)
+                    Write-Host "Upgraded Windows filesystem ACLs for $($record.name)." -ForegroundColor DarkGray
+                }
+            }
+
+            if (-not $record.PSObject.Properties['profile']) {
+                $record | Add-Member -NotePropertyName profile -NotePropertyValue 'Balanced'
+            }
+            if (-not $record.PSObject.Properties['windows_user_sid']) {
+                $record | Add-Member -NotePropertyName windows_user_sid -NotePropertyValue $userSid
+            }
+            if (-not $record.PSObject.Properties['remote_root']) {
+                $remotePath = [string]$record.remote_path
+                if ($remotePath.StartsWith('/')) {
+                    $remoteRoot = if ($remotePath -eq '/') { '/' } else { $remotePath.TrimEnd('/') }
+                    $record | Add-Member -NotePropertyName remote_root -NotePropertyValue $remoteRoot
+                }
+            }
+            $metadataJson = $record | ConvertTo-Json -Depth 6
+            [IO.File]::WriteAllText($metadataPath, $metadataJson, $utf8NoBom)
+        } catch {
+            Write-Warning "Could not upgrade CloudFolder mount metadata in '$mountDir': $($_.Exception.Message)"
+        }
     }
 }
 
@@ -304,6 +415,7 @@ function Install-Runtime {
     Ensure-OpenSshClient
 
     $payloadExe = Get-PayloadExe
+    $payloadCfExe = Get-PayloadCfExe
     $runningBefore = @()
     Get-Service -Name 'CloudFolder.*' -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.Status -eq 'Running') { $runningBefore += $_.Name }
@@ -319,14 +431,20 @@ function Install-Runtime {
         if ((Resolve-Path $payloadExe).Path -ne $destinationExe) {
             Copy-Item -LiteralPath $payloadExe -Destination $destinationExe -Force
         }
+        $destinationCfExe = Join-Path $InstallDir 'cf.exe'
+        if ((Resolve-Path $payloadCfExe).Path -ne $destinationCfExe) {
+            Copy-Item -LiteralPath $payloadCfExe -Destination $destinationCfExe -Force
+        }
         Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'CloudFolder.ps1') -Force
 
-        foreach ($cmdName in @('CloudFolder Manager.cmd','Uninstall CloudFolder.cmd')) {
+        foreach ($cmdName in @('CloudFolder Manager.cmd','Uninstall CloudFolder.cmd','cf.ps1')) {
             $source = Join-Path $ScriptRoot $cmdName
             if (Test-Path $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $InstallDir $cmdName) -Force }
         }
 
         Set-SecureDataAcl
+        Upgrade-ExistingMounts
+        Ensure-CloudFolderOnPath
         Install-StartMenuShortcut
     } finally {
         foreach ($serviceName in $runningBefore) {
@@ -337,6 +455,7 @@ function Install-Runtime {
     }
 
     Write-Host 'CloudFolder runtime is installed.' -ForegroundColor Green
+    Write-Host 'Open a new terminal and use `cf` to work with mounted remote workspaces.' -ForegroundColor DarkGray
 }
 
 function Install-StartMenuShortcut {
@@ -459,6 +578,36 @@ function Grant-ServiceKeyAccess([string]$PrivateKey, [string]$KnownHosts) {
     Assert-NativeExit 'Granting LocalSystem access to known_hosts'
 }
 
+function Resolve-RemoteRoot(
+    [string]$TargetHost,
+    [int]$TargetPort,
+    [string]$TargetUser,
+    [string]$PrivateKey,
+    [string]$KnownHosts,
+    [string]$TargetRemotePath
+) {
+    $path = [string]$TargetRemotePath
+    if ($path -eq '~') { $path = '' }
+    if ($path.StartsWith('~/')) { $path = $path.Substring(2) }
+    $remoteCommand = if ([string]::IsNullOrWhiteSpace($path)) {
+        'pwd -P'
+    } else {
+        'cd -- ' + (ConvertTo-PosixSingleQuoted $path) + ' && pwd -P'
+    }
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $result = (& ssh.exe -p $TargetPort -i $PrivateKey -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KnownHosts "$TargetUser@$TargetHost" $remoteCommand 2>$null | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+    if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result) -or -not $result.StartsWith('/')) {
+        throw "Remote folder could not be resolved to an absolute Linux path: '$TargetRemotePath'"
+    }
+    return $result
+}
+
 function Assert-SafeMountPoint([string]$Path) {
     $root = [IO.Path]::GetPathRoot($Path)
     if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root)) { throw "Mount drive does not exist: $Path" }
@@ -505,6 +654,8 @@ function Add-Mount {
     }
     $targetRemotePath = [string]$targetRemotePath
     if ($targetRemotePath -match '[\r\n]') { throw 'Remote folder cannot contain line breaks.' }
+    if ($targetRemotePath -eq '~') { $targetRemotePath = '' }
+    if ($targetRemotePath.StartsWith('~/')) { $targetRemotePath = $targetRemotePath.Substring(2) }
 
     $defaultMountPoint = Join-Path (Join-Path $env:USERPROFILE 'CloudFolder') (ConvertTo-SafeFolderName $displayName)
     $localMountPoint = if ([string]::IsNullOrWhiteSpace($MountPoint)) { Read-Value 'Local Windows folder' $defaultMountPoint } else { $MountPoint.Trim() }
@@ -531,6 +682,26 @@ function Add-Mount {
 
     $hostKeyAlgorithm = Get-NegotiatedHostKeyAlgorithm $targetHost $targetPort $targetUser $privateKey $knownHosts
     Grant-ServiceKeyAccess $privateKey $knownHosts
+    $remoteRoot = Resolve-RemoteRoot $targetHost $targetPort $targetUser $privateKey $knownHosts $targetRemotePath
+    $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $windowsUserSid = $windowsIdentity.User.Value
+    $windowsFileSecurity = "O:${windowsUserSid}G:${windowsUserSid}D:P(A;;FA;;;$windowsUserSid)(A;;FA;;;SY)(A;;FA;;;BA)"
+
+    if ($Profile -eq 'Dev') {
+        $vfsCacheMode = 'full'
+        $vfsWriteBack = '1s'
+        $vfsCachePollInterval = '2s'
+        $transfers = 8
+        $filePerms = '0777'
+        $dirPerms = '0777'
+    } else {
+        $vfsCacheMode = 'full'
+        $vfsWriteBack = '5s'
+        $vfsCachePollInterval = '30s'
+        $transfers = 4
+        $filePerms = '0666'
+        $dirPerms = '0777'
+    }
 
     $mountDir = Join-Path $MountsDir $slug
     $configPath = Join-Path $mountDir 'service.toml'
@@ -571,15 +742,20 @@ remote = "$(ConvertTo-TomlString $remoteSpec)"
 mount_point = "$(ConvertTo-TomlString $localMountPoint)"
 cache_dir = "$(ConvertTo-TomlString $cacheDir)"
 volume_name = "$(ConvertTo-TomlString $displayName)"
-vfs_cache_mode = "full"
+vfs_cache_mode = "$vfsCacheMode"
 vfs_cache_max_size = "8Gi"
 vfs_cache_max_age = "168h"
 vfs_cache_min_free_space = "5Gi"
-vfs_write_back = "5s"
+vfs_write_back = "$vfsWriteBack"
 dir_cache_time = "30s"
 attr_timeout = "1s"
 buffer_size = "16Mi"
 vfs_read_ahead = "64Mi"
+vfs_cache_poll_interval = "$vfsCachePollInterval"
+transfers = $transfers
+file_perms = "$filePerms"
+dir_perms = "$dirPerms"
+windows_file_security = "$(ConvertTo-TomlString $windowsFileSecurity)"
 read_only = $($ReadOnly.IsPresent.ToString().ToLowerInvariant())
 rc_addr = "127.0.0.1:$rcPort"
 
@@ -609,16 +785,23 @@ keep_files = 5
         port = $targetPort
         user = $targetUser
         remote_path = $targetRemotePath
+        remote_root = $remoteRoot
         mount_point = $localMountPoint
+        profile = $Profile
         config_path = $configPath
         rclone_config = $rcloneConfigPath
+        key_file = $privateKey
+        known_hosts = $knownHosts
+        host_key_algorithm = $hostKeyAlgorithm
+        windows_user_sid = $windowsUserSid
         cache_dir = $cacheDir
         service_log = $serviceLog
         rclone_log = $rcloneLog
         rc_port = $rcPort
         read_only = $ReadOnly.IsPresent
     }
-    $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $metadataPath -Encoding utf8
+    $metadataJson = $metadata | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
     Set-SecureDataAcl
 
     & $InstalledExe check $configPath
@@ -641,7 +824,12 @@ keep_files = 5
 
     Write-Host ''
     Write-Host "Ready: $localMountPoint" -ForegroundColor Green
+    Write-Host "Remote root: $remoteRoot" -ForegroundColor DarkGray
+    Write-Host "Profile: $Profile" -ForegroundColor DarkGray
     Write-Host "It will reconnect automatically after crashes, network drops, and Windows restarts." -ForegroundColor DarkGray
+    if ($Profile -eq 'Dev') {
+        Write-Host "Developer workflow: cd '$localMountPoint' then use cf here / cf run -- <command>." -ForegroundColor Cyan
+    }
     if (-not $NoOpen -and (Read-YesNo 'Open the folder now?' $true)) {
         Start-Process explorer.exe -ArgumentList ('"' + $localMountPoint + '"')
     }
@@ -671,10 +859,18 @@ function Remove-Mount([string]$RequestedName) {
     $record = Resolve-MountRecord $RequestedName
     if (-not $Force -and -not (Read-YesNo "Remove '$($record.name)'? Remote files will NOT be deleted." $false)) { return }
 
-    Stop-CloudFolderService ([string]$record.service_name)
-    if (Get-Service -Name ([string]$record.service_name) -ErrorAction SilentlyContinue) {
-        & sc.exe delete ([string]$record.service_name) | Out-Null
-        Start-Sleep -Seconds 1
+    $serviceName = [string]$record.service_name
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        # A service scheduled for SCM recovery can otherwise race removal and
+        # reappear between Stop and Delete. Disable future starts/recovery first.
+        & sc.exe config $serviceName start= disabled | Out-Null
+        Assert-NativeExit "Disabling $serviceName before removal"
+        & sc.exe failureflag $serviceName 0 | Out-Null
+        Assert-NativeExit "Disabling failure recovery for $serviceName"
+        Stop-CloudFolderService $serviceName
+        & sc.exe delete $serviceName | Out-Null
+        Assert-NativeExit "Deleting Windows service $serviceName"
+        Wait-ServiceDeleted $serviceName
     }
     if ((Test-Path $InstalledExe) -and (Test-Path ([string]$record.config_path))) {
         & $InstalledExe cleanup ([string]$record.config_path) 2>$null | Out-Null
@@ -785,6 +981,7 @@ function Uninstall-CloudFolder {
     }
     Start-Sleep -Seconds 1
     Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-CloudFolderFromPath
     Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     $shortcutFolder = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'CloudFolder'
     Remove-Item -LiteralPath $shortcutFolder -Recurse -Force -ErrorAction SilentlyContinue
