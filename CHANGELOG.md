@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0 - 2026-08-12
+
+Local Workspace / Remote Runtime release. This release lands the planned v0.5, v0.6, and v0.7 capability milestones together.
+
+- Added `cf enter` and a native Execution Router. Git, Python, test runners, package managers, compilers, build tools, and common Linux tooling are transparently routed to the matching remote cwd while local Windows tools remain local.
+- Router shims are native hardlinks to `cf.exe`, preserving argv, quoting, Unicode, remote exit codes, the VFS flush barrier, and local view refresh. A live Formal Gate completes `git -> local edit -> test -> commit` without typing `cf run` once.
+- Added workspace runtime configuration through `.cloudfolder.toml`, including shell wrappers, reusable init scripts, named profiles, `cf env`, `cf env use`, and `cf env reload`. Environment state is shared by routed commands, legacy explicit remote commands, shells, and persistent jobs.
+- Added `cf job run/list/logs/logs -f/attach/stop`. Jobs are detached on the remote host using `setsid + nohup` (falling back to `nohup`) and keep durable state/logs under `~/.cloudfolder/jobs/`, so local SSH loss, CloudFolder restarts, and local-computer shutdown do not terminate the remote task.
+- Added `cf forward`, `cf forward list`, and `cf forward stop` for localhost SSH tunnels without hand-written `ssh -L`, including collision-safe local port selection and PID/command-line verification before stopping a tunnel.
+- Added `cf add <ssh-config-host>` with native Windows OpenSSH config reuse. rclone SFTP now supports the same host alias / ProxyJump / ProxyCommand path through CloudFolder's external-OpenSSH bridge instead of requiring users to re-enter bastion settings.
+- SSH Config mounts keep foreground commands on the user's original OpenSSH config, but freeze the `ssh -G`-resolved target/ProxyJump chain into a mount-private LocalSystem snapshot for background SFTP. Only required identity/certificate/known-hosts material is copied; service private-key copies are SYSTEM-owned with inherited ACLs removed. Passwords are still never stored, and unattended startup must pass OpenSSH `BatchMode`.
+- Added rollback for failed mount creation so a failed SSH-config/service startup cannot leave a half-created CloudFolder service or mount metadata.
+- Added reusable live gates: `scripts/formal-gate.ps1` for Router/Environment/Jobs/Forwarding and `scripts/ssh-config-gate.ps1` for the rule: **If `ssh <host>` works, `cf add <host>` should work.**
+- Added `config/workspace.toml.example`, `cf --version`, expanded Rust unit coverage, and updated Chinese/English/Japanese documentation for the new runtime abstraction.
+
 ## 0.4.0 - 2026-08-10
 
 Developer/agent workflow release.

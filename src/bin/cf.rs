@@ -1,31 +1,73 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 const MOUNTS_DIR: &str = r"C:\ProgramData\CloudFolder\mounts";
+const DATA_DIR: &str = r"C:\ProgramData\CloudFolder";
 const AGENT_BEGIN: &str = "<!-- CloudFolder agent instructions: begin -->";
 const AGENT_END: &str = "<!-- CloudFolder agent instructions: end -->";
+const ROUTED_TOOLS: &[&str] = &[
+    "git",
+    "python",
+    "python3",
+    "pytest",
+    "uv",
+    "pip",
+    "pip3",
+    "conda",
+    "cargo",
+    "rustc",
+    "gcc",
+    "g++",
+    "clang",
+    "clang++",
+    "cmake",
+    "make",
+    "ninja",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "go",
+    "java",
+    "javac",
+    "mvn",
+    "gradle",
+    "rg",
+    "find",
+    "bash",
+    "sh",
+    "nvidia-smi",
+];
 const AGENT_INSTRUCTIONS: &str = r#"## CloudFolder remote workspaces
 
 When the current working directory is inside a CloudFolder mount:
 
 - Use normal local filesystem tools to read, edit, search, create, rename, and delete workspace files.
 - If unsure whether the current directory is a CloudFolder workspace, run `cf here`.
-- Run Git, builds, tests, package managers, compilers, project interpreters, and other Linux/project commands on the remote host with `cf run -- <program> [args...]`.
-- For repository-wide grep/find/search operations that touch many cold files, prefer remote tools such as `cf run -- rg ...` or `cf run -- find ...`; targeted file reads and edits can stay local.
-- For pipelines, redirects, shell operators, or compound commands, use `cf sh -- "<shell command>"`.
-- `cf run` waits for pending local writes, maps the local working directory to the matching remote Linux directory, executes there, and refreshes the mounted directory view afterward.
+- Prefer starting the agent from `cf enter <mount>` (or run `cf enter` while already inside the mount). In that session Git, Python, tests, package managers, compilers, and common Linux tooling are transparently routed to the matching remote runtime, so plain commands such as `git status`, `pytest`, and `python train.py` are correct.
+- For repository-wide grep/find/search operations that touch many cold files, use the routed remote tools; targeted file reads and edits stay local through the mounted Windows path.
+- If a command must explicitly bypass routing and target the Windows machine, invoke the Windows executable by absolute path or start it outside `cf enter`.
+- Legacy `cf run` / `cf sh` remain available for scripts and explicit automation, but normal interactive and agent workflows should not need them after `cf enter`.
+- Workspace runtime state from `.cloudfolder.toml` is applied automatically to routed commands, explicit remote commands, and persistent jobs.
 - Do not run a second coding agent on the remote host just to work on this workspace. The coding agent stays local; CloudFolder bridges files and remote execution.
 - Keep commands intentionally targeting the local Windows machine local.
 
-Direct local Git operations against a CloudFolder mount may be slow because Git performs many small random accesses inside `.git`; prefer `cf run -- git ...`.
+Outside a `cf enter` session, direct local Git operations against a CloudFolder mount may still be slow because Git performs many small random accesses inside `.git`; enter the routed runtime before repository-wide CLI work.
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,12 +91,70 @@ struct MountRecord {
     key_file: String,
     #[serde(default)]
     known_hosts: String,
+    #[serde(default)]
+    ssh_alias: String,
+    #[serde(default)]
+    ssh_config: String,
     rc_port: u16,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct WorkspaceConfig {
+    #[serde(default)]
+    environment: EnvironmentConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct EnvironmentConfig {
+    #[serde(default)]
+    shell: String,
+    #[serde(default)]
+    init: String,
+    #[serde(default)]
+    active: String,
+    #[serde(default)]
+    profiles: BTreeMap<String, EnvironmentProfile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct EnvironmentProfile {
+    #[serde(default)]
+    shell: String,
+    #[serde(default)]
+    init: String,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveEnvironment {
+    config_path: Option<PathBuf>,
+    shell: String,
+    init: String,
+    active: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ForwardState {
+    mount_slug: String,
+    remote_port: u16,
+    local_port: u16,
+    pid: u32,
+    started_epoch: u64,
 }
 
 fn main() {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
-    match dispatch(&args) {
+    let invoked_tool = env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+        })
+        .and_then(|name| routed_tool_from_exe_name(&name));
+    let result = match invoked_tool {
+        Some(tool) => native_routed_tool(&tool, &args),
+        None => dispatch(&args),
+    };
+    match result {
         Ok(code) => exit(code),
         Err(error) => {
             eprintln!("cf: {error:#}");
@@ -73,10 +173,20 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
             print_usage();
             Ok(0)
         }
+        Some("version" | "-v" | "--version") => {
+            println!("CloudFolder {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         Some("list") => native_list(),
         Some("path") => native_path(&args[1..]),
         Some("here") => native_here(),
         Some("status") => native_status(&args[1..]),
+        Some("enter") => native_enter(&args[1..]),
+        Some("env") => native_env(&args[1..]),
+        Some("job") => native_job(&args[1..]),
+        Some("forward") => native_forward(&args[1..]),
+        Some("add") => native_add(&args[1..]),
+        Some("ssh-proxy") => native_ssh_proxy(&args[1..]),
         Some("flush") => native_flush(&args[1..]),
         Some("refresh") => native_refresh(&args[1..]),
         Some("run") => native_run(&args[1..]),
@@ -94,6 +204,17 @@ fn print_usage() {
   cf path <mount>\n\
   cf here\n\
   cf status [mount]\n\
+  cf enter [mount]\n\
+  cf env [use <profile>|reload]\n\
+  cf job run [mount] -- <program> [args...]\n\
+  cf job list [mount]\n\
+  cf job logs [-f] <job> [--mount <mount>]\n\
+  cf job stop <job> [--mount <mount>]\n\
+  cf job attach <job> [--mount <mount>]\n\
+  cf forward <remote-port> [local-port] [--mount <mount>]\n\
+  cf forward list [mount]\n\
+  cf forward stop <local-port|all> [--mount <mount>]\n\
+  cf add <ssh-config-host>\n\
   cf flush [mount]\n\
   cf refresh [mount]\n\
   cf run [mount] -- <program> [args...]\n\
@@ -102,8 +223,13 @@ fn print_usage() {
   cf agent setup|status|remove\n\n\
 Examples:\n\
   cd (cf path lab)\n\
+  cf enter\n\
+  git status\n\
+  pytest -q\n\
+  cf job run -- python train.py\n\
+  cf forward 8888\n\
+  cf add h100\n\
   cf run -- git status\n\
-  cf run -- pytest -q\n\
   cf sh -- \"git status && pytest -q\"\n\
   cf shell\n\
   cf agent setup"
@@ -193,6 +319,497 @@ fn native_status(args: &[OsString]) -> Result<i32> {
     })
 }
 
+fn native_enter(args: &[OsString]) -> Result<i32> {
+    let requested = single_optional_name(args)?;
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let start_dir = if relative_components(&cwd, Path::new(&record.mount_point)).is_some() {
+        cwd
+    } else {
+        PathBuf::from(&record.mount_point)
+    };
+    let router = ensure_router_shims()?;
+    let current_path = env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![router.clone()];
+    paths.extend(env::split_paths(&current_path));
+    let routed_path = env::join_paths(paths).context("cannot construct routed PATH")?;
+
+    println!("Entering CloudFolder runtime: {}", record.name);
+    println!("Local workspace: {}", start_dir.display());
+    println!("Remote root: {}", resolve_remote_root(&record)?);
+    println!("Transparent remote tools: {}", ROUTED_TOOLS.join(", "));
+    println!("Local tools such as cd/dir/explorer/code remain local.");
+
+    let status = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoExit"])
+        .env("CLOUDFOLDER_ENTER_MOUNT", &record.slug)
+        .env("CLOUDFOLDER_ROUTER_ACTIVE", "1")
+        .env("CLOUDFOLDER_RUNTIME_DIR", runtime_dir()?)
+        .env("PATH", routed_path)
+        .current_dir(start_dir)
+        .status()
+        .context("failed to start the routed PowerShell session")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn native_routed_tool(tool: &str, args: &[OsString]) -> Result<i32> {
+    let requested = env::var("CLOUDFOLDER_ENTER_MOUNT").ok();
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    if matches!(tool, "bash" | "sh") && args.is_empty() {
+        let remote_cwd = remote_working_directory(&record, &cwd)?;
+        let environment = effective_environment(&record, &cwd)?;
+        wait_for_flush(&record, Duration::from_secs(60))?;
+        let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
+        if !environment.init.trim().is_empty() {
+            body.push_str(environment.init.trim_end());
+            body.push('\n');
+        }
+        body.push_str("set +e\n");
+        body.push_str(&format!("exec {tool} -l"));
+        let remote_command = wrap_environment_shell(&environment, &body);
+        let code = run_ssh(&record, true, &remote_command)?;
+        let _ = refresh_vfs(&record);
+        return Ok(code);
+    }
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(OsString::from(tool));
+    command.extend_from_slice(args);
+    execute_remote_argv(&record, &cwd, &command)
+}
+
+fn routed_tool_from_exe_name(name: &str) -> Option<String> {
+    let normalized = name.to_ascii_lowercase();
+    ROUTED_TOOLS
+        .iter()
+        .find(|tool| tool.eq_ignore_ascii_case(&normalized))
+        .map(|value| (*value).to_string())
+}
+
+fn router_bin_dir() -> PathBuf {
+    env::var_os("CLOUDFOLDER_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DATA_DIR))
+        .join("router")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("bin")
+}
+
+fn ensure_router_shims() -> Result<PathBuf> {
+    let source = env::current_exe().context("cannot locate cf.exe")?;
+    let dir = router_bin_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    for tool in ROUTED_TOOLS {
+        let path = dir.join(format!("{tool}.exe"));
+        if path.exists() {
+            continue;
+        }
+        if fs::hard_link(&source, &path).is_err() {
+            fs::copy(&source, &path)
+                .with_context(|| format!("cannot create router shim {}", path.display()))?;
+        }
+    }
+    Ok(dir)
+}
+
+fn native_env(args: &[OsString]) -> Result<i32> {
+    let entered = env::var("CLOUDFOLDER_ENTER_MOUNT").ok();
+    let record = resolve_mount(entered.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    match args.first().and_then(|arg| arg.to_str()) {
+        None => {
+            print_effective_environment(&record, &cwd)?;
+            Ok(0)
+        }
+        Some("reload") if args.len() == 1 => {
+            let environment = effective_environment(&record, &cwd)?;
+            println!(
+                "Environment config reloaded: {}",
+                environment
+                    .config_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "defaults (no .cloudfolder.toml)".to_string())
+            );
+            println!("Commands read this environment on every invocation; no daemon restart is required.");
+            Ok(0)
+        }
+        Some("use") if args.len() == 2 => {
+            let profile = args[1].to_string_lossy().to_string();
+            set_environment_profile(&record, &cwd, &profile)?;
+            println!("Active CloudFolder environment profile: {profile}");
+            Ok(0)
+        }
+        _ => bail!("usage: cf env [use <profile>|reload]"),
+    }
+}
+
+fn print_effective_environment(record: &MountRecord, cwd: &Path) -> Result<()> {
+    let environment = effective_environment(record, cwd)?;
+    println!(
+        "Config:  {}",
+        environment
+            .config_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    println!(
+        "Profile: {}",
+        if environment.active.is_empty() {
+            "(base)"
+        } else {
+            environment.active.as_str()
+        }
+    );
+    println!(
+        "Shell:   {}",
+        if environment.shell.is_empty() {
+            "(remote default shell)"
+        } else {
+            environment.shell.as_str()
+        }
+    );
+    if environment.init.trim().is_empty() {
+        println!("Init:    (none)");
+    } else {
+        println!("Init:\n{}", environment.init.trim_end());
+    }
+    Ok(())
+}
+
+fn native_add(args: &[OsString]) -> Result<i32> {
+    if args.len() != 1 {
+        bail!("usage: cf add <ssh-config-host>");
+    }
+    let host = args[0].to_string_lossy().to_string();
+    if host.trim().is_empty() || host.starts_with('-') {
+        bail!("usage: cf add <ssh-config-host>");
+    }
+    launch_manager_powershell(&[
+        OsString::from("-Action"),
+        OsString::from("Add"),
+        OsString::from("-SshHost"),
+        OsString::from(host),
+        OsString::from("-NonInteractive"),
+        OsString::from("-NoOpen"),
+    ])
+}
+
+fn native_ssh_proxy(args: &[OsString]) -> Result<i32> {
+    let delimiter = args
+        .iter()
+        .position(|arg| arg == OsStr::new("--"))
+        .ok_or_else(|| anyhow!("internal ssh-proxy invocation is missing --"))?;
+    let control = &args[..delimiter];
+    let passthrough = &args[delimiter + 1..];
+    let mut home = None;
+    let mut config = None;
+    let mut target = None;
+    let mut index = 0;
+    while index < control.len() {
+        let flag = control[index].to_string_lossy();
+        let value = control
+            .get(index + 1)
+            .ok_or_else(|| anyhow!("internal ssh-proxy option {flag} is missing a value"))?;
+        match flag.as_ref() {
+            "--home" => home = Some(PathBuf::from(value)),
+            "--config" => config = Some(PathBuf::from(value)),
+            "--target" => target = Some(value.to_string_lossy().to_string()),
+            _ => bail!("unknown internal ssh-proxy option {flag}"),
+        }
+        index += 2;
+    }
+    let home = home.ok_or_else(|| anyhow!("internal ssh-proxy home is missing"))?;
+    let target = target.ok_or_else(|| anyhow!("internal ssh-proxy target is missing"))?;
+    let mut command = Command::new("ssh.exe");
+    if let Some(config) = config.filter(|path| !path.as_os_str().is_empty()) {
+        command.arg("-F").arg(config);
+    }
+    command
+        .args(["-o", "BatchMode=yes"])
+        .env("USERPROFILE", &home)
+        .env("HOME", &home);
+    let subsystem = passthrough
+        .first()
+        .is_some_and(|arg| arg == OsStr::new("-s"));
+    if !subsystem {
+        command.arg("-n");
+    }
+    command.arg(target).args(passthrough);
+    let status = command
+        .status()
+        .context("CloudFolder ssh-proxy could not start Windows OpenSSH")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn native_job(args: &[OsString]) -> Result<i32> {
+    let action = args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .unwrap_or("list")
+        .to_ascii_lowercase();
+    match action.as_str() {
+        "run" => job_run(&args[1..]),
+        "list" => job_list(&args[1..]),
+        "logs" => job_logs(&args[1..], false),
+        "attach" => job_logs(&args[1..], true),
+        "stop" => job_stop(&args[1..]),
+        _ => bail!("usage: cf job run|list|logs|attach|stop"),
+    }
+}
+
+fn job_run(args: &[OsString]) -> Result<i32> {
+    let (requested, command) = split_remote_command(args)?;
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let remote_cwd = remote_working_directory(&record, &cwd)?;
+    let environment = effective_environment(&record, &cwd)?;
+    wait_for_flush(&record, Duration::from_secs(60))?;
+    let id = new_job_id();
+    let job_dir = format!("$HOME/.cloudfolder/jobs/{id}");
+    let command_text = command
+        .iter()
+        .map(|arg| quote_posix(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\n");
+    body.push_str(&format!(
+        "{command_text}\nrc=$?\nprintf '%s\\n' \"$rc\" > {job_dir}/exit_code\nprintf 'exited\\n' > {job_dir}/state\nexit \"$rc\""
+    ));
+    let body = wrap_environment_shell(&environment, &body);
+    let display_command = command
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remote = format!(
+        "set -eu; d={job_dir}; mkdir -p \"$d\"; printf '%s\\n' {} > \"$d/cwd\"; printf '%s\\n' {} > \"$d/command\"; date +%s > \"$d/started\"; : > \"$d/stdout.log\"; if command -v setsid >/dev/null 2>&1; then nohup setsid sh -lc {} > \"$d/stdout.log\" 2>&1 < /dev/null & printf 'setsid\\n' > \"$d/mode\"; else nohup sh -lc {} > \"$d/stdout.log\" 2>&1 < /dev/null & printf 'plain\\n' > \"$d/mode\"; fi; p=$!; printf '%s\\n' \"$p\" > \"$d/pid\"; printf 'running\\n' > \"$d/state\"; printf '%s\\t%s\\n' {} \"$p\"",
+        quote_posix(&remote_cwd),
+        quote_posix(&display_command),
+        quote_posix(&body),
+        quote_posix(&body),
+        quote_posix(&id),
+    );
+    let (code, stdout, stderr) = run_ssh_capture(&record, &remote)?;
+    if code != 0 {
+        bail!("could not start persistent job: {}", stderr.trim());
+    }
+    print!("{stdout}");
+    println!(
+        "Job {id} is detached; it continues if this SSH session or local computer disconnects."
+    );
+    Ok(0)
+}
+
+fn job_list(args: &[OsString]) -> Result<i32> {
+    let requested = single_optional_name(args)?;
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let remote = r#"root="$HOME/.cloudfolder/jobs"; [ -d "$root" ] || exit 0; find "$root" -mindepth 1 -maxdepth 1 -type d -name 'cf-*' -print 2>/dev/null | while IFS= read -r d; do id=$(basename "$d"); pid=$(cat "$d/pid" 2>/dev/null || true); state=$(cat "$d/state" 2>/dev/null || echo unknown); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state=running; elif [ -f "$d/exit_code" ]; then state="exited($(cat "$d/exit_code"))"; elif [ "$state" = running ]; then state=unknown; fi; started=$(cat "$d/started" 2>/dev/null || echo '?'); cmd=$(cat "$d/command" 2>/dev/null || echo '?'); printf '%s\t%s\t%s\t%s\n' "$id" "$state" "$started" "$cmd"; done"#;
+    let (code, stdout, stderr) = run_ssh_capture(&record, remote)?;
+    if code != 0 {
+        bail!("could not list jobs: {}", stderr.trim());
+    }
+    if stdout.trim().is_empty() {
+        println!("No CloudFolder jobs on {}.", record.name);
+    } else {
+        println!("Job\tState\tStarted(epoch)\tCommand");
+        print!("{stdout}");
+    }
+    Ok(0)
+}
+
+fn job_logs(args: &[OsString], force_follow: bool) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    let mut follow = force_follow;
+    let mut id = None;
+    for arg in rest {
+        if arg == OsStr::new("-f") || arg == OsStr::new("--follow") {
+            follow = true;
+        } else if id.is_none() {
+            id = Some(arg.to_string_lossy().to_string());
+        } else {
+            bail!("usage: cf job logs [-f] <job> [--mount <mount>]");
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!("a job id is required"))?;
+    validate_job_id(&id)?;
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let path = format!("$HOME/.cloudfolder/jobs/{id}/stdout.log");
+    let remote = if follow {
+        format!("test -f {path} && exec tail -n 100 -F {path}")
+    } else {
+        format!("test -f {path} && cat {path}")
+    };
+    run_ssh(&record, false, &remote)
+}
+
+fn job_stop(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    if rest.len() != 1 {
+        bail!("usage: cf job stop <job> [--mount <mount>]");
+    }
+    let id = rest[0].to_string_lossy().to_string();
+    validate_job_id(&id)?;
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let d = format!("$HOME/.cloudfolder/jobs/{id}");
+    let remote = format!(
+        "set -eu; d={d}; test -d \"$d\"; p=$(cat \"$d/pid\"); mode=$(cat \"$d/mode\" 2>/dev/null || echo plain); if kill -0 \"$p\" 2>/dev/null; then if [ \"$mode\" = setsid ]; then kill -TERM -- -\"$p\" 2>/dev/null || kill -TERM \"$p\"; else kill -TERM \"$p\"; fi; fi; printf 'stopped\\n' > \"$d/state\"; printf 'stopped %s\\n' {}",
+        quote_posix(&id)
+    );
+    run_ssh(&record, false, &remote)
+}
+
+fn new_job_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mixed = nanos ^ ((std::process::id() as u64) << 16);
+    format!("cf-{:08x}", mixed as u32)
+}
+
+fn validate_job_id(id: &str) -> Result<()> {
+    if id.starts_with("cf-")
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Ok(())
+    } else {
+        bail!("invalid CloudFolder job id")
+    }
+}
+
+fn native_forward(args: &[OsString]) -> Result<i32> {
+    let first = args.first().and_then(|arg| arg.to_str()).unwrap_or("list");
+    if first.eq_ignore_ascii_case("list") {
+        return forward_list(&args[1..]);
+    }
+    if first.eq_ignore_ascii_case("stop") {
+        return forward_stop(&args[1..]);
+    }
+    forward_start(args)
+}
+
+fn forward_start(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    if rest.is_empty() || rest.len() > 2 {
+        bail!("usage: cf forward <remote-port> [local-port] [--mount <mount>]");
+    }
+    let remote_port = parse_port(&rest[0], "remote port")?;
+    let requested_local = if rest.len() == 2 {
+        Some(parse_port(&rest[1], "local port")?)
+    } else {
+        None
+    };
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let local_port = choose_local_port(
+        requested_local.unwrap_or(remote_port),
+        requested_local.is_some(),
+    )?;
+    let mut command = ssh_command(&record)?;
+    command
+        .arg("-N")
+        .arg("-L")
+        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg(ssh_target(&record));
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let mut child = command
+        .spawn()
+        .context("failed to start SSH port forward")?;
+    thread::sleep(Duration::from_millis(600));
+    if let Some(status) = child.try_wait().context("cannot inspect SSH forward")? {
+        bail!("SSH port forward exited immediately with {status}");
+    }
+    let state = ForwardState {
+        mount_slug: record.slug.clone(),
+        remote_port,
+        local_port,
+        pid: child.id(),
+        started_epoch: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    save_forward_state(&record, &state)?;
+    println!(
+        "Forward active: {} remote 127.0.0.1:{} -> 127.0.0.1:{} (pid {})",
+        record.name, remote_port, local_port, state.pid
+    );
+    println!("Web URL (if applicable): http://127.0.0.1:{local_port}/");
+    Ok(0)
+}
+
+fn forward_list(args: &[OsString]) -> Result<i32> {
+    let requested = single_optional_name(args)?;
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let states = load_forward_states(&record)?;
+    if states.is_empty() {
+        println!("No saved forwards for {}.", record.name);
+        return Ok(0);
+    }
+    println!("Local\tRemote\tPID\tState");
+    for state in states {
+        let active = forward_process_matches(&state);
+        println!(
+            "{}\t{}\t{}\t{}",
+            state.local_port,
+            state.remote_port,
+            state.pid,
+            if active { "running" } else { "stale" }
+        );
+    }
+    Ok(0)
+}
+
+fn forward_stop(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    if rest.len() != 1 {
+        bail!("usage: cf forward stop <local-port|all> [--mount <mount>]");
+    }
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let states = load_forward_states(&record)?;
+    let all = rest[0].to_string_lossy().eq_ignore_ascii_case("all");
+    let target_port = if all {
+        None
+    } else {
+        Some(parse_port(&rest[0], "local port")?)
+    };
+    let mut matched = false;
+    for state in states {
+        if target_port.is_some_and(|port| port != state.local_port) {
+            continue;
+        }
+        matched = true;
+        if forward_process_matches(&state) {
+            let _ = Command::new("taskkill.exe")
+                .args(["/PID", &state.pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = fs::remove_file(forward_state_path(&record, state.local_port));
+        println!("Stopped forward localhost:{}.", state.local_port);
+    }
+    if !matched {
+        bail!("no matching forward was found");
+    }
+    Ok(0)
+}
+
 fn native_agent(args: &[OsString]) -> Result<i32> {
     let action = args
         .first()
@@ -261,34 +878,19 @@ fn native_run(args: &[OsString]) -> Result<i32> {
     let (requested, command) = split_remote_command(args)?;
     let record = resolve_mount(requested.as_deref(), true)?;
     let cwd = env::current_dir().context("cannot read the current directory")?;
-    let remote_cwd = remote_working_directory(&record, &cwd)?;
-    wait_for_flush(&record, Duration::from_secs(60))?;
-
-    let mut remote_command = format!("cd -- {} && exec", quote_posix(&remote_cwd));
-    for arg in command {
-        remote_command.push(' ');
-        remote_command.push_str(&quote_posix(&arg.to_string_lossy()));
-    }
-    let code = run_ssh(&record, false, &remote_command)?;
-    let _ = refresh_vfs(&record);
-    Ok(code)
+    execute_remote_argv(&record, &cwd, &command)
 }
 
 fn native_sh(args: &[OsString]) -> Result<i32> {
     let (requested, command) = split_remote_command(args)?;
     let record = resolve_mount(requested.as_deref(), true)?;
     let cwd = env::current_dir().context("cannot read the current directory")?;
-    let remote_cwd = remote_working_directory(&record, &cwd)?;
-    wait_for_flush(&record, Duration::from_secs(60))?;
     let shell_text = command
         .iter()
         .map(|value| value.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
-    let remote_command = format!("cd -- {} && {shell_text}", quote_posix(&remote_cwd));
-    let code = run_ssh(&record, false, &remote_command)?;
-    let _ = refresh_vfs(&record);
-    Ok(code)
+    execute_remote_shell(&record, &cwd, &shell_text)
 }
 
 fn native_shell(args: &[OsString]) -> Result<i32> {
@@ -296,17 +898,67 @@ fn native_shell(args: &[OsString]) -> Result<i32> {
     let record = resolve_mount(requested.as_deref(), true)?;
     let cwd = env::current_dir().context("cannot read the current directory")?;
     let remote_cwd = remote_working_directory(&record, &cwd)?;
+    let environment = effective_environment(&record, &cwd)?;
     wait_for_flush(&record, Duration::from_secs(60))?;
-    let remote_command = format!(
-        "cd -- {} && exec ${{SHELL:-/bin/sh}} -l",
-        quote_posix(&remote_cwd)
-    );
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\n");
+    body.push_str("exec ${SHELL:-/bin/sh} -l");
+    let remote_command = wrap_environment_shell(&environment, &body);
     let code = run_ssh(&record, true, &remote_command)?;
     let _ = refresh_vfs(&record);
     Ok(code)
 }
 
+fn execute_remote_argv(record: &MountRecord, cwd: &Path, command: &[OsString]) -> Result<i32> {
+    if command.is_empty() {
+        bail!("remote command is empty");
+    }
+    let remote_cwd = remote_working_directory(record, cwd)?;
+    let environment = effective_environment(record, cwd)?;
+    wait_for_flush(record, Duration::from_secs(60))?;
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\n");
+    body.push_str("exec");
+    for arg in command {
+        body.push(' ');
+        body.push_str(&quote_posix(&arg.to_string_lossy()));
+    }
+    let remote_command = wrap_environment_shell(&environment, &body);
+    let code = run_ssh(record, false, &remote_command)?;
+    let _ = refresh_vfs(record);
+    Ok(code)
+}
+
+fn execute_remote_shell(record: &MountRecord, cwd: &Path, shell_text: &str) -> Result<i32> {
+    let remote_cwd = remote_working_directory(record, cwd)?;
+    let environment = effective_environment(record, cwd)?;
+    wait_for_flush(record, Duration::from_secs(60))?;
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\n");
+    body.push_str(shell_text);
+    let remote_command = wrap_environment_shell(&environment, &body);
+    let code = run_ssh(record, false, &remote_command)?;
+    let _ = refresh_vfs(record);
+    Ok(code)
+}
+
 fn launch_powershell(args: &[OsString]) -> Result<i32> {
+    launch_powershell_named(args)
+}
+
+fn launch_powershell_named(args: &[OsString]) -> Result<i32> {
     let script = launcher_script()?;
     let status = Command::new("powershell.exe")
         .args([
@@ -323,12 +975,179 @@ fn launch_powershell(args: &[OsString]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn launch_manager_powershell(args: &[OsString]) -> Result<i32> {
+    let script = manager_script()?;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .args(args)
+        .status()
+        .context("failed to start CloudFolder manager")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn effective_environment(record: &MountRecord, cwd: &Path) -> Result<EffectiveEnvironment> {
+    let Some(config_path) = find_workspace_config(record, cwd) else {
+        return Ok(EffectiveEnvironment {
+            config_path: None,
+            shell: String::new(),
+            init: String::new(),
+            active: String::new(),
+        });
+    };
+    let text = fs::read_to_string(&config_path)
+        .with_context(|| format!("cannot read {}", config_path.display()))?;
+    let config: WorkspaceConfig = toml::from_str(&text).with_context(|| {
+        format!(
+            "invalid CloudFolder workspace config {}",
+            config_path.display()
+        )
+    })?;
+    let mut shell = config.environment.shell.clone();
+    let mut init = config.environment.init.clone();
+    let active = environment_profile_override(record, &config_path)?
+        .unwrap_or_else(|| config.environment.active.clone());
+    if !active.trim().is_empty() {
+        let profile = config.environment.profiles.get(&active).ok_or_else(|| {
+            anyhow!(
+                "environment profile '{}' is not defined in {}",
+                active,
+                config_path.display()
+            )
+        })?;
+        if !profile.shell.trim().is_empty() {
+            shell = profile.shell.clone();
+        }
+        if !profile.init.trim().is_empty() {
+            if !init.trim().is_empty() {
+                init.push('\n');
+            }
+            init.push_str(&profile.init);
+        }
+    }
+    Ok(EffectiveEnvironment {
+        config_path: Some(config_path),
+        shell,
+        init,
+        active,
+    })
+}
+
+fn find_workspace_config(record: &MountRecord, cwd: &Path) -> Option<PathBuf> {
+    let root = PathBuf::from(&record.mount_point);
+    let mut current = if relative_components(cwd, &root).is_some() {
+        cwd.to_path_buf()
+    } else {
+        root.clone()
+    };
+    loop {
+        let candidate = current.join(".cloudfolder.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if comparable_components(&current) == comparable_components(&root) {
+            break;
+        }
+        if !current.pop() || relative_components(&current, &root).is_none() {
+            break;
+        }
+    }
+    None
+}
+
+fn environment_profile_state_path(record: &MountRecord) -> PathBuf {
+    mount_data_dir(record).join("environment-profile")
+}
+
+fn environment_profile_override(
+    record: &MountRecord,
+    config_path: &Path,
+) -> Result<Option<String>> {
+    let path = environment_profile_state_path(record);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut lines = text.lines();
+    let stored_config = lines.next().unwrap_or_default();
+    let profile = lines.next().unwrap_or_default();
+    if stored_config.eq_ignore_ascii_case(&config_path.to_string_lossy())
+        && !profile.trim().is_empty()
+    {
+        Ok(Some(profile.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn set_environment_profile(record: &MountRecord, cwd: &Path, profile: &str) -> Result<()> {
+    let config_path = find_workspace_config(record, cwd).ok_or_else(|| {
+        anyhow!(
+            "no .cloudfolder.toml exists between the current directory and {}",
+            record.mount_point
+        )
+    })?;
+    let text = fs::read_to_string(&config_path)
+        .with_context(|| format!("cannot read {}", config_path.display()))?;
+    let config: WorkspaceConfig = toml::from_str(&text).with_context(|| {
+        format!(
+            "invalid CloudFolder workspace config {}",
+            config_path.display()
+        )
+    })?;
+    if !config.environment.profiles.contains_key(profile) {
+        bail!(
+            "environment profile '{}' is not defined in {}",
+            profile,
+            config_path.display()
+        );
+    }
+    let state_path = environment_profile_state_path(record);
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    fs::write(
+        &state_path,
+        format!("{}\n{}\n", config_path.display(), profile),
+    )
+    .with_context(|| format!("cannot write {}", state_path.display()))?;
+    Ok(())
+}
+
+fn wrap_environment_shell(environment: &EffectiveEnvironment, body: &str) -> String {
+    if environment.shell.trim().is_empty() {
+        body.to_string()
+    } else {
+        format!("{} {}", environment.shell.trim(), quote_posix(body))
+    }
+}
+
 fn launcher_script() -> Result<PathBuf> {
     let exe = env::current_exe().context("cannot locate cf.exe")?;
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow!("cannot locate the CloudFolder install directory"))?;
     let script = parent.join("cf.ps1");
+    if !script.is_file() {
+        bail!("missing {}", script.display());
+    }
+    Ok(script)
+}
+
+fn manager_script() -> Result<PathBuf> {
+    let exe = env::current_exe().context("cannot locate cf.exe")?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| anyhow!("cannot locate the CloudFolder install directory"))?;
+    let script = parent.join("CloudFolder.ps1");
     if !script.is_file() {
         bail!("missing {}", script.display());
     }
@@ -455,13 +1274,29 @@ fn remove_agent_block(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn mounts_dir() -> PathBuf {
+    env::var_os("CLOUDFOLDER_MOUNTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(MOUNTS_DIR))
+}
+
+fn mount_data_dir(record: &MountRecord) -> PathBuf {
+    if !record.rclone_config.trim().is_empty() {
+        let path = PathBuf::from(&record.rclone_config);
+        if let Some(parent) = path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    mounts_dir().join(&record.slug)
+}
+
 fn load_mounts() -> Result<Vec<MountRecord>> {
-    let root = Path::new(MOUNTS_DIR);
+    let root = mounts_dir();
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut records = Vec::new();
-    for entry in fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))? {
+    for entry in fs::read_dir(&root).with_context(|| format!("cannot read {}", root.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -626,18 +1461,15 @@ fn resolve_remote_root(record: &MountRecord) -> Result<String> {
             .unwrap_or(&record.remote_path);
         format!("cd -- {} && pwd -P", quote_posix(relative))
     };
-    let output = ssh_command(record)?
-        .arg(format!("{}@{}", record.user, record.host))
-        .arg(command)
-        .output()
-        .context("failed to resolve the remote root through SSH")?;
-    if !output.status.success() {
-        bail!("could not resolve the remote root for '{}'", record.name);
+    let (code, stdout, stderr) = run_ssh_capture(record, &command)?;
+    if code != 0 {
+        bail!(
+            "could not resolve the remote root for '{}': {}",
+            record.name,
+            stderr.trim()
+        );
     }
-    let root = String::from_utf8(output.stdout)
-        .context("remote root was not valid UTF-8")?
-        .trim()
-        .to_string();
+    let root = stdout.trim().to_string();
     if !root.starts_with('/') {
         bail!("remote root is not an absolute Linux path: {root}");
     }
@@ -657,28 +1489,52 @@ fn run_ssh(record: &MountRecord, tty: bool, remote_command: &str) -> Result<i32>
     if tty {
         command.arg("-t");
     }
-    command
-        .arg(format!("{}@{}", record.user, record.host))
-        .arg(remote_command);
+    command.arg(ssh_target(record)).arg(remote_command);
     let status = command
         .status()
         .context("failed to start Windows OpenSSH")?;
     Ok(status.code().unwrap_or(1))
 }
 
+fn run_ssh_capture(record: &MountRecord, remote_command: &str) -> Result<(i32, String, String)> {
+    let output = ssh_command(record)?
+        .arg(ssh_target(record))
+        .arg(remote_command)
+        .output()
+        .context("failed to start Windows OpenSSH")?;
+    Ok((
+        output.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn ssh_target(record: &MountRecord) -> String {
+    if record.ssh_alias.trim().is_empty() {
+        format!("{}@{}", record.user, record.host)
+    } else {
+        record.ssh_alias.clone()
+    }
+}
+
 fn ssh_command(record: &MountRecord) -> Result<Command> {
-    let (key_file, known_hosts) = ssh_files(record)?;
     let mut command = Command::new("ssh.exe");
+    if record.ssh_alias.trim().is_empty() {
+        let (key_file, known_hosts) = ssh_files(record)?;
+        command
+            .arg("-p")
+            .arg(record.port.to_string())
+            .arg("-i")
+            .arg(key_file)
+            .args(["-o", "IdentitiesOnly=yes"])
+            .args(["-o", "StrictHostKeyChecking=yes"])
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    } else if !record.ssh_config.trim().is_empty() {
+        command.arg("-F").arg(&record.ssh_config);
+    }
     command
-        .arg("-p")
-        .arg(record.port.to_string())
-        .arg("-i")
-        .arg(key_file)
         .args(["-o", "BatchMode=yes"])
-        .args(["-o", "IdentitiesOnly=yes"])
-        .args(["-o", "StrictHostKeyChecking=yes"])
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
         .args(["-o", "ServerAliveInterval=15"])
         .args(["-o", "ServerAliveCountMax=3"]);
     Ok(command)
@@ -779,15 +1635,139 @@ fn rc_json(record: &MountRecord, method: &str) -> Result<Value> {
 }
 
 fn installed_sibling(name: &str) -> Result<PathBuf> {
-    let exe = env::current_exe().context("cannot locate cf.exe")?;
-    let path = exe
-        .parent()
-        .ok_or_else(|| anyhow!("cannot locate the CloudFolder install directory"))?
-        .join(name);
+    let path = runtime_dir()?.join(name);
     if !path.is_file() {
         bail!("missing {}", path.display());
     }
     Ok(path)
+}
+
+fn runtime_dir() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("CLOUDFOLDER_RUNTIME_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    let exe = env::current_exe().context("cannot locate cf.exe")?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("cannot locate the CloudFolder install directory"))
+}
+
+fn extract_mount_flag(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)> {
+    let mut requested = None;
+    let mut rest = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == OsStr::new("--mount") {
+            if requested.is_some() {
+                bail!("--mount may be specified only once");
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("--mount requires a mount name"))?;
+            requested = Some(value.to_string_lossy().to_string());
+            index += 2;
+        } else {
+            rest.push(args[index].clone());
+            index += 1;
+        }
+    }
+    Ok((requested, rest))
+}
+
+fn parse_port(value: &OsStr, label: &str) -> Result<u16> {
+    let text = value.to_string_lossy();
+    let port: u16 = text
+        .parse()
+        .with_context(|| format!("{label} must be a TCP port between 1 and 65535"))?;
+    if port == 0 {
+        bail!("{label} must be a TCP port between 1 and 65535");
+    }
+    Ok(port)
+}
+
+fn choose_local_port(preferred: u16, explicit: bool) -> Result<u16> {
+    match TcpListener::bind(("127.0.0.1", preferred)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(preferred)
+        }
+        Err(error) if explicit => bail!("local port {preferred} is unavailable: {error}"),
+        Err(_) => {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .context("could not allocate a free local forwarding port")?;
+            let port = listener
+                .local_addr()
+                .context("could not inspect the allocated local forwarding port")?
+                .port();
+            drop(listener);
+            Ok(port)
+        }
+    }
+}
+
+fn forward_state_dir(record: &MountRecord) -> PathBuf {
+    mount_data_dir(record).join("forwards")
+}
+
+fn forward_state_path(record: &MountRecord, local_port: u16) -> PathBuf {
+    forward_state_dir(record).join(format!("{local_port}.json"))
+}
+
+fn save_forward_state(record: &MountRecord, state: &ForwardState) -> Result<()> {
+    let dir = forward_state_dir(record);
+    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let bytes = serde_json::to_vec_pretty(state).context("cannot serialize forward state")?;
+    let path = forward_state_path(record, state.local_port);
+    fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
+}
+
+fn load_forward_states(record: &MountRecord) -> Result<Vec<ForwardState>> {
+    let dir = forward_state_dir(record);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut states = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("cannot read {}", dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        let state: ForwardState = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid forward state {}", entry.path().display()))?;
+        if state.mount_slug.eq_ignore_ascii_case(&record.slug) {
+            states.push(state);
+        }
+    }
+    states.sort_by_key(|state| state.local_port);
+    Ok(states)
+}
+
+fn forward_process_matches(state: &ForwardState) -> bool {
+    let script = format!(
+        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {}\" -ErrorAction SilentlyContinue; if($p){{$p.CommandLine}}",
+        state.pid
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-Command"])
+        .arg(script)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    let forward = format!(
+        "127.0.0.1:{}:127.0.0.1:{}",
+        state.local_port, state.remote_port
+    );
+    command_line.contains("ssh") && command_line.contains(&forward)
 }
 
 fn split_remote_command(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)> {
@@ -826,6 +1806,38 @@ fn quote_posix(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "cloudfolder-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn test_mount(root: &Path, data: &Path) -> MountRecord {
+        MountRecord {
+            name: "Test".to_string(),
+            slug: "test".to_string(),
+            service_name: "CloudFolder.test".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            user: "alice".to_string(),
+            remote_path: "/workspace".to_string(),
+            remote_root: "/workspace".to_string(),
+            mount_point: root.to_string_lossy().to_string(),
+            profile: "Dev".to_string(),
+            rclone_config: data.join("rclone.conf").to_string_lossy().to_string(),
+            key_file: String::new(),
+            known_hosts: String::new(),
+            ssh_alias: String::new(),
+            ssh_config: String::new(),
+            rc_port: 55770,
+        }
+    }
+
     #[test]
     fn launcher_path_is_relative_to_executable() {
         if let Ok(path) = launcher_script() {
@@ -857,6 +1869,31 @@ mod tests {
     }
 
     #[test]
+    fn router_only_claims_remote_runtime_tools() {
+        assert_eq!(routed_tool_from_exe_name("git").as_deref(), Some("git"));
+        assert_eq!(
+            routed_tool_from_exe_name("PYTHON").as_deref(),
+            Some("python")
+        );
+        assert!(routed_tool_from_exe_name("explorer").is_none());
+        assert!(routed_tool_from_exe_name("code").is_none());
+        assert!(routed_tool_from_exe_name("cf").is_none());
+    }
+
+    #[test]
+    fn mount_flag_extraction_preserves_other_arguments() {
+        let args = vec![
+            OsString::from("8080"),
+            OsString::from("--mount"),
+            OsString::from("lab"),
+            OsString::from("18080"),
+        ];
+        let (mount, rest) = extract_mount_flag(&args).unwrap();
+        assert_eq!(mount.as_deref(), Some("lab"));
+        assert_eq!(rest, vec![OsString::from("8080"), OsString::from("18080")]);
+    }
+
+    #[test]
     fn mount_json_accepts_utf8_bom() {
         let json = br#"{"name":"x","slug":"x","service_name":"CloudFolder.x","host":"example.com","port":22,"user":"alice","mount_point":"C:\\CloudFolder\\x","rc_port":55770}"#;
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
@@ -866,12 +1903,92 @@ mod tests {
     }
 
     #[test]
+    fn workspace_environment_merges_profile_without_rewriting_config() {
+        let root = unique_test_dir("env-root");
+        let nested = root.join("project").join("src");
+        let data = unique_test_dir("env-data");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let config_path = root.join(".cloudfolder.toml");
+        fs::write(
+            &config_path,
+            r#"[environment]
+shell = "bash -lc"
+init = "export BASE=1"
+active = "gpu"
+
+[environment.profiles.gpu]
+init = "export DEVICE=gpu"
+
+[environment.profiles.cpu]
+shell = "zsh -lc"
+init = "export DEVICE=cpu"
+"#,
+        )
+        .unwrap();
+        let record = test_mount(&root, &data);
+        let base = effective_environment(&record, &nested).unwrap();
+        assert_eq!(base.shell, "bash -lc");
+        assert_eq!(base.active, "gpu");
+        assert!(base.init.contains("export BASE=1"));
+        assert!(base.init.contains("export DEVICE=gpu"));
+
+        set_environment_profile(&record, &nested, "cpu").unwrap();
+        let selected = effective_environment(&record, &nested).unwrap();
+        assert_eq!(selected.shell, "zsh -lc");
+        assert_eq!(selected.active, "cpu");
+        assert!(selected.init.contains("export DEVICE=cpu"));
+        let original = fs::read_to_string(&config_path).unwrap();
+        assert!(original.contains("active = \"gpu\""));
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn environment_shell_wraps_one_remote_body() {
+        let environment = EffectiveEnvironment {
+            config_path: None,
+            shell: "bash -lc".to_string(),
+            init: String::new(),
+            active: String::new(),
+        };
+        let wrapped = wrap_environment_shell(&environment, "echo 'hello'");
+        assert!(wrapped.starts_with("bash -lc "));
+        assert!(wrapped.contains("echo"));
+        assert!(wrapped.contains("hello"));
+    }
+
+    #[test]
+    fn forward_state_round_trips_per_mount() {
+        let root = unique_test_dir("forward-root");
+        let data = unique_test_dir("forward-data");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let record = test_mount(&root, &data);
+        let state = ForwardState {
+            mount_slug: "test".to_string(),
+            remote_port: 8888,
+            local_port: 18888,
+            pid: 1234,
+            started_epoch: 42,
+        };
+        save_forward_state(&record, &state).unwrap();
+        let loaded = load_forward_states(&record).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].remote_port, 8888);
+        assert_eq!(loaded[0].local_port, 18888);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
     fn managed_agent_block_preserves_existing_content() {
         let original = "# My instructions\r\n\r\nKeep this.\r\n";
         let installed = upsert_managed_block(original).unwrap();
         assert!(installed.starts_with("# My instructions\r\n\r\nKeep this."));
         assert!(installed.contains(AGENT_BEGIN));
-        assert!(installed.contains("cf run --"));
+        assert!(installed.contains("cf enter"));
         let removed = remove_managed_block_text(&installed).unwrap();
         assert_eq!(removed, original);
     }

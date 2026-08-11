@@ -3,6 +3,7 @@ param(
     [ValidateSet('Menu','Install','Add','List','Remove','Restart','Open','Logs','Doctor','Uninstall')]
     [string]$Action = 'Menu',
     [string]$Name,
+    [string]$SshHost,
     [string]$RemoteHost,
     [int]$Port = 0,
     [string]$RemoteUser,
@@ -13,6 +14,7 @@ param(
     [string]$Profile = 'Dev',
     [switch]$ReadOnly,
     [switch]$SkipKeyAuthorization,
+    [switch]$NonInteractive,
     [switch]$SkipAdd,
     [switch]$NoOpen,
     [switch]$Force,
@@ -28,6 +30,7 @@ $DataDir = 'C:\ProgramData\CloudFolder'
 $MountsDir = Join-Path $DataDir 'mounts'
 $LogsDir = Join-Path $DataDir 'logs'
 $InstalledExe = Join-Path $InstallDir 'CloudFolderService.exe'
+$InstalledCf = Join-Path $InstallDir 'cf.exe'
 $InstalledRclone = Join-Path $InstallDir 'rclone.exe'
 $RcloneVersion = '1.75.0'
 $RcloneZipSha256 = '203581f0a7baeae873f2347483a798c79e2eaf5c384a4e9d866aa374f1c89ac0'
@@ -299,6 +302,7 @@ function Set-SecureDataAcl {
         & icacls.exe (Join-Path $DataDir '*') /reset /T /C | Out-Null
         Assert-NativeExit 'Resetting CloudFolder child ACLs'
     }
+    Repair-AllServiceSshSnapshots
 }
 
 function Upgrade-ExistingMounts {
@@ -578,6 +582,283 @@ function Grant-ServiceKeyAccess([string]$PrivateKey, [string]$KnownHosts) {
     Assert-NativeExit 'Granting LocalSystem access to known_hosts'
 }
 
+function Get-UserSshConfigPath {
+    $path = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'config'
+    if (Test-Path -LiteralPath $path) { return (Resolve-Path -LiteralPath $path).Path }
+    return ''
+}
+
+function Get-SshResolvedConfig([string]$Alias, [string]$SshConfigPath) {
+    if ([string]::IsNullOrWhiteSpace($Alias) -or $Alias -notmatch '^[A-Za-z0-9._-]+$') {
+        throw 'SSH config host aliases may contain only letters, numbers, dot, underscore, and hyphen.'
+    }
+    $sshArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($SshConfigPath)) { $sshArgs += @('-F', $SshConfigPath) }
+    $sshArgs += @('-G', $Alias)
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& ssh.exe @sshArgs 2>$null)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+    if ($exitCode -ne 0 -or $lines.Count -eq 0) {
+        throw "OpenSSH could not resolve '$Alias'. Verify that `ssh $Alias` works first."
+    }
+    $values = @{}
+    foreach ($line in $lines) {
+        if ([string]$line -match '^([^\s]+)\s+(.+)$') {
+            $key = $Matches[1].ToLowerInvariant()
+            if (-not $values.ContainsKey($key)) { $values[$key] = $Matches[2].Trim() }
+        }
+    }
+    foreach ($required in @('hostname','user','port')) {
+        if (-not $values.ContainsKey($required)) { throw "OpenSSH -G did not return '$required' for '$Alias'." }
+    }
+    return [pscustomobject]@{
+        Alias = $Alias
+        HostName = [string]$values['hostname']
+        User = [string]$values['user']
+        Port = [int]$values['port']
+        Lines = @($lines)
+    }
+}
+
+function Invoke-SshAliasCommand([string]$Alias, [string]$SshConfigPath, [string]$RemoteCommand, [switch]$Capture) {
+    $sshArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($SshConfigPath)) { $sshArgs += @('-F', $SshConfigPath) }
+    $sshArgs += @('-o', 'BatchMode=yes', $Alias, $RemoteCommand)
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        if ($Capture) {
+            $result = (& ssh.exe @sshArgs 2>$null | Out-String).Trim()
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $result }
+        }
+        & ssh.exe @sshArgs
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = '' }
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+}
+
+function Test-SshAliasLogin([string]$Alias, [string]$SshConfigPath) {
+    $result = Invoke-SshAliasCommand $Alias $SshConfigPath 'printf cloudfolder-ok' -Capture
+    return ($result.ExitCode -eq 0 -and $result.Output -eq 'cloudfolder-ok')
+}
+
+function Get-ProxyJumpAliases([string[]]$ResolvedLines) {
+    $aliases = @()
+    foreach ($line in $ResolvedLines) {
+        if ([string]$line -notmatch '^proxyjump\s+(.+)$') { continue }
+        $value = $Matches[1].Trim()
+        if ([string]::IsNullOrWhiteSpace($value) -or $value -ieq 'none') { continue }
+        foreach ($hop in ($value -split ',')) {
+            $candidate = $hop.Trim()
+            if ($candidate.Contains('@')) { $candidate = $candidate.Substring($candidate.LastIndexOf('@') + 1) }
+            if ($candidate.StartsWith('[') -and $candidate.Contains(']')) {
+                $candidate = $candidate.Substring(1, $candidate.IndexOf(']') - 1)
+            } elseif ($candidate -match '^(.+?):\d+$') {
+                $candidate = $Matches[1]
+            }
+            if ($candidate -match '^[A-Za-z0-9._-]+$') { $aliases += $candidate }
+        }
+    }
+    return @($aliases | Select-Object -Unique)
+}
+
+function Resolve-SshAliasRemoteRoot([string]$Alias, [string]$SshConfigPath, [string]$TargetRemotePath) {
+    $path = [string]$TargetRemotePath
+    if ($path -eq '~') { $path = '' }
+    if ($path.StartsWith('~/')) { $path = $path.Substring(2) }
+    $remoteCommand = if ([string]::IsNullOrWhiteSpace($path)) {
+        'pwd -P'
+    } else {
+        'cd -- ' + (ConvertTo-PosixSingleQuoted $path) + ' && pwd -P'
+    }
+    $result = Invoke-SshAliasCommand $Alias $SshConfigPath $remoteCommand -Capture
+    if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output) -or -not $result.Output.StartsWith('/')) {
+        throw "Remote folder could not be resolved through SSH config host '$Alias': '$TargetRemotePath'"
+    }
+    return $result.Output
+}
+
+function ConvertFrom-SshHomePath([string]$Value) {
+    $value = $Value.Trim().Trim('"')
+    if ($value -eq '~') { return $env:USERPROFILE }
+    if ($value.StartsWith('~/') -or $value.StartsWith('~\')) {
+        return (Join-Path $env:USERPROFILE $value.Substring(2))
+    }
+    return [Environment]::ExpandEnvironmentVariables($value)
+}
+
+function Protect-ServiceSshPrivateFile([string]$Path) {
+    & icacls.exe $Path /grant:r '*S-1-5-18:R' '*S-1-5-32-544:F' | Out-Null
+    Assert-NativeExit "Restricting service SSH material '$Path'"
+    & icacls.exe $Path /inheritance:r | Out-Null
+    Assert-NativeExit "Removing inherited ACLs from '$Path'"
+    & icacls.exe $Path /setowner '*S-1-5-18' | Out-Null
+    Assert-NativeExit "Setting LocalSystem owner on '$Path'"
+}
+
+function Protect-ServiceSshPublicFile([string]$Path, [switch]$WritableBySystem) {
+    $systemRight = if ($WritableBySystem) { '*S-1-5-18:M' } else { '*S-1-5-18:R' }
+    & icacls.exe $Path /grant:r $systemRight '*S-1-5-32-544:F' | Out-Null
+    Assert-NativeExit "Restricting service SSH file '$Path'"
+    & icacls.exe $Path /inheritance:r | Out-Null
+    Assert-NativeExit "Removing inherited ACLs from '$Path'"
+}
+
+function Get-SshConfigTokens([string]$Value) {
+    $items = @()
+    foreach ($match in [regex]::Matches($Value, '"[^"]+"|\S+')) {
+        $items += ([string]$match.Value).Trim('"')
+    }
+    return @($items)
+}
+
+function New-ServiceSshSnapshot([string]$MountDir, [object[]]$ResolvedHosts) {
+    $sshDir = Join-Path $MountDir 'ssh-service'
+    New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+    $serviceConfigPath = Join-Path $sshDir 'config'
+
+    $knownHostsPath = Join-Path $sshDir 'known_hosts'
+    $knownLines = New-Object System.Collections.Generic.HashSet[string]([StringComparer]::Ordinal)
+    foreach ($resolved in $ResolvedHosts) {
+        foreach ($line in @($resolved.Lines)) {
+            if ([string]$line -notmatch '^userknownhostsfile\s+(.+)$') { continue }
+            foreach ($token in @(Get-SshConfigTokens $Matches[1])) {
+                if ($token -ieq 'none' -or $token -ieq 'NUL') { continue }
+                $candidate = ConvertFrom-SshHomePath $token
+                if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+                foreach ($knownLine in Get-Content -LiteralPath $candidate -ErrorAction SilentlyContinue) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$knownLine)) { [void]$knownLines.Add([string]$knownLine) }
+                }
+            }
+        }
+    }
+    [IO.File]::WriteAllLines($knownHostsPath, @($knownLines), (New-Object Text.UTF8Encoding($false)))
+    Protect-ServiceSshPublicFile $knownHostsPath -WritableBySystem
+
+    $privateCopies = @{}
+    $certificateCopies = @{}
+    $privateIndex = 0
+    $certificateIndex = 0
+    $serviceConfigLines = New-Object System.Collections.Generic.List[string]
+    $excluded = @(
+        'host','localforward','remoteforward','dynamicforward','remotecommand','localcommand',
+        'permitlocalcommand','requesttty','sessiontype','stdinnull','forkafterauthentication',
+        'controlmaster','controlpath','controlpersist','clearallforwardings','forwardagent',
+        'forwardx11','forwardx11trusted','forwardx11timeout','gatewayports'
+    )
+
+    foreach ($resolved in $ResolvedHosts) {
+        [void]$serviceConfigLines.Add(('Host ' + [string]$resolved.Alias))
+        $wroteKnownHosts = $false
+        foreach ($line in @($resolved.Lines)) {
+            $text = [string]$line
+            if ($text -notmatch '^([^\s]+)\s+(.+)$') { continue }
+            $key = $Matches[1].ToLowerInvariant()
+            $value = $Matches[2].Trim()
+            if ($key -in $excluded) { continue }
+
+            if ($key -eq 'identityfile') {
+                $source = ConvertFrom-SshHomePath $value
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+                if (-not $privateCopies.ContainsKey($source)) {
+                    $privateIndex++
+                    $destination = Join-Path $sshDir ("identity-$privateIndex")
+                    Copy-Item -LiteralPath $source -Destination $destination -Force
+                    Protect-ServiceSshPrivateFile $destination
+                    $privateCopies[$source] = $destination
+                }
+                [void]$serviceConfigLines.Add(('  identityfile "' + ([string]$privateCopies[$source]).Replace('\','/') + '"'))
+                continue
+            }
+
+            if ($key -eq 'certificatefile') {
+                if ($value -ieq 'none') { continue }
+                $source = ConvertFrom-SshHomePath $value
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+                if (-not $certificateCopies.ContainsKey($source)) {
+                    $certificateIndex++
+                    $destination = Join-Path $sshDir ("certificate-$certificateIndex")
+                    Copy-Item -LiteralPath $source -Destination $destination -Force
+                    Protect-ServiceSshPublicFile $destination
+                    $certificateCopies[$source] = $destination
+                }
+                [void]$serviceConfigLines.Add(('  certificatefile "' + ([string]$certificateCopies[$source]).Replace('\','/') + '"'))
+                continue
+            }
+
+            if ($key -eq 'userknownhostsfile') {
+                if (-not $wroteKnownHosts) {
+                    [void]$serviceConfigLines.Add(('  userknownhostsfile "' + $knownHostsPath.Replace('\','/') + '"'))
+                    $wroteKnownHosts = $true
+                }
+                continue
+            }
+
+            if ($key -eq 'proxycommand' -and $value -match '(?i)^ssh(?:\.exe)?(\s+.*)$') {
+                $sshExe = 'C:/Windows/System32/OpenSSH/ssh.exe'
+                $serviceConfigForProxy = $serviceConfigPath.Replace('\','/')
+                $text = 'proxycommand "' + $sshExe + '" -F "' + $serviceConfigForProxy + '"' + $Matches[1]
+            }
+
+            [void]$serviceConfigLines.Add(('  ' + $text))
+        }
+        if (-not $wroteKnownHosts) {
+            [void]$serviceConfigLines.Add(('  userknownhostsfile "' + $knownHostsPath.Replace('\','/') + '"'))
+        }
+        [void]$serviceConfigLines.Add('')
+    }
+
+    [IO.File]::WriteAllLines($serviceConfigPath, @($serviceConfigLines), (New-Object Text.UTF8Encoding($false)))
+    Protect-ServiceSshPublicFile $serviceConfigPath
+
+    return $serviceConfigPath
+}
+
+function Protect-ServiceSshSnapshot([string]$ServiceConfigPath) {
+    if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { return }
+    $sshDir = Split-Path -Parent $ServiceConfigPath
+    if (-not (Test-Path -LiteralPath $sshDir)) { return }
+    $configPath = Join-Path $sshDir 'config'
+    $knownHostsPath = Join-Path $sshDir 'known_hosts'
+    if (Test-Path -LiteralPath $configPath) { Protect-ServiceSshPublicFile $configPath }
+    if (Test-Path -LiteralPath $knownHostsPath) { Protect-ServiceSshPublicFile $knownHostsPath -WritableBySystem }
+    Get-ChildItem -LiteralPath $sshDir -Filter 'identity-*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        Protect-ServiceSshPrivateFile $_.FullName
+    }
+    Get-ChildItem -LiteralPath $sshDir -Filter 'certificate-*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        Protect-ServiceSshPublicFile $_.FullName
+    }
+}
+
+function Repair-AllServiceSshSnapshots {
+    if (-not (Test-Path -LiteralPath $MountsDir)) { return }
+    Get-ChildItem -LiteralPath $MountsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $serviceConfigPath = Join-Path $_.FullName 'ssh-service\config'
+        if (Test-Path -LiteralPath $serviceConfigPath) {
+            Protect-ServiceSshSnapshot $serviceConfigPath
+        }
+    }
+}
+
+function ConvertTo-RcloneSshToken([string]$Value) {
+    $normalized = $Value.Replace('\','/')
+    if ($normalized -match '[\s"]') { return '"' + $normalized.Replace('"','\"') + '"' }
+    return $normalized
+}
+
+function Get-RcloneExternalSshCommand([string]$Alias, [string]$SshConfigPath) {
+    $parts = @($InstalledCf, 'ssh-proxy', '--home', $env:USERPROFILE)
+    if (-not [string]::IsNullOrWhiteSpace($SshConfigPath)) { $parts += @('--config', $SshConfigPath) }
+    $parts += @('--target', $Alias, '--')
+    return (($parts | ForEach-Object { ConvertTo-RcloneSshToken ([string]$_) }) -join ' ')
+}
+
 function Resolve-RemoteRoot(
     [string]$TargetHost,
     [int]$TargetPort,
@@ -630,7 +911,18 @@ function Add-Mount {
     Write-Host 'Press Enter to accept values shown in [brackets].' -ForegroundColor DarkGray
     Write-Host ''
 
-    $displayName = if ([string]::IsNullOrWhiteSpace($Name)) { Read-Value 'Friendly name (example: Lab Server)' } else { $Name.Trim() }
+    $usingSshConfig = -not [string]::IsNullOrWhiteSpace($SshHost)
+    if ($usingSshConfig) {
+        $SshHost = $SshHost.Trim()
+        if ($SshHost -notmatch '^[A-Za-z0-9._-]+$') { throw 'SSH config host alias contains unsupported characters.' }
+    }
+    $displayName = if (-not [string]::IsNullOrWhiteSpace($Name)) {
+        $Name.Trim()
+    } elseif ($usingSshConfig) {
+        $SshHost
+    } else {
+        Read-Value 'Friendly name (example: Lab Server)'
+    }
     if ([string]::IsNullOrWhiteSpace($displayName)) { throw 'A mount name is required.' }
     $slug = ConvertTo-Slug $displayName
     $serviceName = Get-ServiceName $slug
@@ -639,50 +931,91 @@ function Add-Mount {
         throw "A CloudFolder mount named '$displayName' already exists. Remove it first or choose another name."
     }
 
-    $targetHost = if ([string]::IsNullOrWhiteSpace($RemoteHost)) { Read-Value 'Server address (IP or hostname)' } else { $RemoteHost.Trim() }
-    if ([string]::IsNullOrWhiteSpace($targetHost)) { throw 'Server address is required.' }
-    if ($targetHost -notmatch '^[A-Za-z0-9._:-]+$') { throw 'Server address contains unsupported characters.' }
-    $targetPort = if ($Port -gt 0) { $Port } else { [int](Read-Value 'SSH port' '22') }
-    if ($targetPort -lt 1 -or $targetPort -gt 65535) { throw 'SSH port must be between 1 and 65535.' }
-    $targetUser = if ([string]::IsNullOrWhiteSpace($RemoteUser)) { Read-Value 'SSH username' } else { $RemoteUser.Trim() }
-    if ([string]::IsNullOrWhiteSpace($targetUser)) { throw 'SSH username is required.' }
-    if ($targetUser -notmatch '^[A-Za-z0-9._-]+$') { throw 'SSH username contains unsupported characters.' }
+    $sshConfigPath = ''
+    $sshResolved = $null
+    if ($usingSshConfig) {
+        $sshConfigPath = Get-UserSshConfigPath
+        $sshResolved = Get-SshResolvedConfig $SshHost $sshConfigPath
+        $targetHost = $sshResolved.HostName
+        $targetPort = $sshResolved.Port
+        $targetUser = $sshResolved.User
+        Write-Host ("Using OpenSSH config host '{0}' -> {1}@{2}:{3}" -f $SshHost,$targetUser,$targetHost,$targetPort) -ForegroundColor DarkGray
+    } else {
+        $targetHost = if ([string]::IsNullOrWhiteSpace($RemoteHost)) { Read-Value 'Server address (IP or hostname)' } else { $RemoteHost.Trim() }
+        if ([string]::IsNullOrWhiteSpace($targetHost)) { throw 'Server address is required.' }
+        if ($targetHost -notmatch '^[A-Za-z0-9._:-]+$') { throw 'Server address contains unsupported characters.' }
+        $targetPort = if ($Port -gt 0) { $Port } else { [int](Read-Value 'SSH port' '22') }
+        if ($targetPort -lt 1 -or $targetPort -gt 65535) { throw 'SSH port must be between 1 and 65535.' }
+        $targetUser = if ([string]::IsNullOrWhiteSpace($RemoteUser)) { Read-Value 'SSH username' } else { $RemoteUser.Trim() }
+        if ([string]::IsNullOrWhiteSpace($targetUser)) { throw 'SSH username is required.' }
+        if ($targetUser -notmatch '^[A-Za-z0-9._-]+$') { throw 'SSH username contains unsupported characters.' }
+    }
 
     $targetRemotePath = $RemotePath
-    if ($null -eq $targetRemotePath) {
+    if ($null -eq $targetRemotePath -and -not $NonInteractive) {
         $targetRemotePath = Read-Value 'Remote folder (blank = SSH home directory)' ''
     }
+    if ($null -eq $targetRemotePath) { $targetRemotePath = '' }
     $targetRemotePath = [string]$targetRemotePath
     if ($targetRemotePath -match '[\r\n]') { throw 'Remote folder cannot contain line breaks.' }
     if ($targetRemotePath -eq '~') { $targetRemotePath = '' }
     if ($targetRemotePath.StartsWith('~/')) { $targetRemotePath = $targetRemotePath.Substring(2) }
 
     $defaultMountPoint = Join-Path (Join-Path $env:USERPROFILE 'CloudFolder') (ConvertTo-SafeFolderName $displayName)
-    $localMountPoint = if ([string]::IsNullOrWhiteSpace($MountPoint)) { Read-Value 'Local Windows folder' $defaultMountPoint } else { $MountPoint.Trim() }
+    $localMountPoint = if (-not [string]::IsNullOrWhiteSpace($MountPoint)) {
+        $MountPoint.Trim()
+    } elseif ($NonInteractive) {
+        $defaultMountPoint
+    } else {
+        Read-Value 'Local Windows folder' $defaultMountPoint
+    }
     $localMountPoint = [Environment]::ExpandEnvironmentVariables($localMountPoint)
     if ($localMountPoint -match '[\r\n]') { throw 'Local mount point cannot contain line breaks.' }
     if (-not [IO.Path]::IsPathRooted($localMountPoint)) { throw 'Local mount point must be an absolute Windows path.' }
     Assert-SafeMountPoint $localMountPoint
 
-    $privateKey = Ensure-KeyFile $KeyFile
-    $knownHosts = Get-KnownHostsPath
-
-    Ensure-HostTrust $targetHost $targetPort $targetUser $privateKey $knownHosts
-
-    $alreadyWorks = Test-KeyLogin $targetHost $targetPort $targetUser $privateKey $knownHosts
-    if (-not $alreadyWorks) {
-        if ($SkipKeyAuthorization) {
-            throw 'The selected SSH key is not authorized on the server.'
+    $privateKey = ''
+    $knownHosts = ''
+    $hostKeyAlgorithm = ''
+    $serviceSshResolved = @()
+    $serviceSshConfigPath = ''
+    if ($usingSshConfig) {
+        if (-not (Test-SshAliasLogin $SshHost $sshConfigPath)) {
+            throw "Formal Gate failed: 'ssh $SshHost' must work non-interactively before 'cf add $SshHost' can adopt it."
         }
-        Authorize-Key $targetHost $targetPort $targetUser $privateKey $knownHosts
-    }
-    if (-not (Test-KeyLogin $targetHost $targetPort $targetUser $privateKey $knownHosts)) {
-        throw 'CloudFolder could not establish strict key-only SSH after authorization.'
-    }
+        $serviceSshResolved = @($sshResolved)
+        $seenJumpHosts = New-Object System.Collections.Generic.HashSet[string]([StringComparer]::OrdinalIgnoreCase)
+        $jumpQueue = New-Object System.Collections.Generic.Queue[string]
+        foreach ($jumpHost in @(Get-ProxyJumpAliases $sshResolved.Lines)) { $jumpQueue.Enqueue($jumpHost) }
+        while ($jumpQueue.Count -gt 0) {
+            $jumpHost = $jumpQueue.Dequeue()
+            if (-not $seenJumpHosts.Add($jumpHost)) { continue }
+            $jumpResolved = Get-SshResolvedConfig $jumpHost $sshConfigPath
+            $serviceSshResolved += $jumpResolved
+            foreach ($nestedJump in @(Get-ProxyJumpAliases $jumpResolved.Lines)) { $jumpQueue.Enqueue($nestedJump) }
+        }
+        $remoteRoot = Resolve-SshAliasRemoteRoot $SshHost $sshConfigPath $targetRemotePath
+    } else {
+        $privateKey = Ensure-KeyFile $KeyFile
+        $knownHosts = Get-KnownHostsPath
 
-    $hostKeyAlgorithm = Get-NegotiatedHostKeyAlgorithm $targetHost $targetPort $targetUser $privateKey $knownHosts
-    Grant-ServiceKeyAccess $privateKey $knownHosts
-    $remoteRoot = Resolve-RemoteRoot $targetHost $targetPort $targetUser $privateKey $knownHosts $targetRemotePath
+        Ensure-HostTrust $targetHost $targetPort $targetUser $privateKey $knownHosts
+
+        $alreadyWorks = Test-KeyLogin $targetHost $targetPort $targetUser $privateKey $knownHosts
+        if (-not $alreadyWorks) {
+            if ($SkipKeyAuthorization) {
+                throw 'The selected SSH key is not authorized on the server.'
+            }
+            Authorize-Key $targetHost $targetPort $targetUser $privateKey $knownHosts
+        }
+        if (-not (Test-KeyLogin $targetHost $targetPort $targetUser $privateKey $knownHosts)) {
+            throw 'CloudFolder could not establish strict key-only SSH after authorization.'
+        }
+
+        $hostKeyAlgorithm = Get-NegotiatedHostKeyAlgorithm $targetHost $targetPort $targetUser $privateKey $knownHosts
+        Grant-ServiceKeyAccess $privateKey $knownHosts
+        $remoteRoot = Resolve-RemoteRoot $targetHost $targetPort $targetUser $privateKey $knownHosts $targetRemotePath
+    }
     $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsUserSid = $windowsIdentity.User.Value
     $windowsFileSecurity = "O:${windowsUserSid}G:${windowsUserSid}D:P(A;;FA;;;$windowsUserSid)(A;;FA;;;SY)(A;;FA;;;BA)"
@@ -713,13 +1046,28 @@ function Add-Mount {
     $cacheDir = Join-Path $mountRoot (".CloudFolderCache\$slug")
     $rcPort = Get-NextRcPort
 
-    New-Item -ItemType Directory -Force -Path $mountDir,$LogsDir,$cacheDir | Out-Null
-    $mountParent = Split-Path -Parent $localMountPoint
-    if (-not (Test-Path -LiteralPath $mountParent)) {
-        New-Item -ItemType Directory -Force -Path $mountParent | Out-Null
-    }
+    $serviceCreated = $false
+    try {
+        New-Item -ItemType Directory -Force -Path $mountDir,$LogsDir,$cacheDir | Out-Null
+        Set-SecureDataAcl
+        $mountParent = Split-Path -Parent $localMountPoint
+        if (-not (Test-Path -LiteralPath $mountParent)) {
+            New-Item -ItemType Directory -Force -Path $mountParent | Out-Null
+        }
 
-    $rcloneConfig = @"
+        if ($usingSshConfig) {
+            $serviceSshConfigPath = New-ServiceSshSnapshot $mountDir $serviceSshResolved
+            $externalSsh = Get-RcloneExternalSshCommand $SshHost $serviceSshConfigPath
+            $rcloneConfig = @"
+[remote]
+type = sftp
+ssh = $externalSsh
+known_hosts_file = none
+shell_type = unix
+idle_timeout = 20s
+"@
+        } else {
+            $rcloneConfig = @"
 [remote]
 type = sftp
 host = $targetHost
@@ -731,7 +1079,8 @@ host_key_algorithms = $hostKeyAlgorithm
 shell_type = unix
 idle_timeout = 20s
 "@
-    $rcloneConfig | Set-Content -LiteralPath $rcloneConfigPath -Encoding utf8
+        }
+        $rcloneConfig | Set-Content -LiteralPath $rcloneConfigPath -Encoding utf8
 
     $remoteSpec = if ([string]::IsNullOrWhiteSpace($targetRemotePath)) { 'remote:' } else { 'remote:' + $targetRemotePath }
     $serviceConfig = @"
@@ -792,6 +1141,9 @@ keep_files = 5
         rclone_config = $rcloneConfigPath
         key_file = $privateKey
         known_hosts = $knownHosts
+        ssh_alias = if ($usingSshConfig) { $SshHost } else { '' }
+        ssh_config = if ($usingSshConfig) { $sshConfigPath } else { '' }
+        service_ssh_config = if ($usingSshConfig) { $serviceSshConfigPath } else { '' }
         host_key_algorithm = $hostKeyAlgorithm
         windows_user_sid = $windowsUserSid
         cache_dir = $cacheDir
@@ -800,27 +1152,42 @@ keep_files = 5
         rc_port = $rcPort
         read_only = $ReadOnly.IsPresent
     }
-    $metadataJson = $metadata | ConvertTo-Json -Depth 4
-    [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
-    Set-SecureDataAcl
+        $metadataJson = $metadata | ConvertTo-Json -Depth 4
+        [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
 
-    & $InstalledExe check $configPath
-    Assert-NativeExit 'CloudFolder connection preflight'
+        & $InstalledExe check $configPath
+        Assert-NativeExit 'CloudFolder connection preflight'
 
-    Remove-Item -LiteralPath $serviceLog -Force -ErrorAction SilentlyContinue
-    $binPath = '"' + $InstalledExe + '" service ' + $serviceName + ' "' + $configPath + '"'
-    New-Service -Name $serviceName -BinaryPathName $binPath -DisplayName ("CloudFolder - $displayName") -StartupType Automatic | Out-Null
-    & sc.exe description $serviceName "CloudFolder mount: $targetUser@$targetHost`:$targetPort -> $localMountPoint" | Out-Null
-    & sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
-    Assert-NativeExit 'Configuring Windows service recovery'
-    & sc.exe failureflag $serviceName 1 | Out-Null
-    Assert-NativeExit 'Enabling Windows service recovery'
-    & sc.exe config $serviceName start= delayed-auto | Out-Null
-    Assert-NativeExit 'Configuring delayed automatic start'
+        Remove-Item -LiteralPath $serviceLog -Force -ErrorAction SilentlyContinue
+        $binPath = '"' + $InstalledExe + '" service ' + $serviceName + ' "' + $configPath + '"'
+        New-Service -Name $serviceName -BinaryPathName $binPath -DisplayName ("CloudFolder - $displayName") -StartupType Automatic | Out-Null
+        $serviceCreated = $true
+        & sc.exe description $serviceName "CloudFolder mount: $targetUser@$targetHost`:$targetPort -> $localMountPoint" | Out-Null
+        & sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+        Assert-NativeExit 'Configuring Windows service recovery'
+        & sc.exe failureflag $serviceName 1 | Out-Null
+        Assert-NativeExit 'Enabling Windows service recovery'
+        & sc.exe config $serviceName start= delayed-auto | Out-Null
+        Assert-NativeExit 'Configuring delayed automatic start'
 
-    Start-Service -Name $serviceName
-    $record = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-    Wait-MountReady $record
+        Start-Service -Name $serviceName
+        $record = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+        Wait-MountReady $record
+    } catch {
+        $failure = $_
+        if ($serviceCreated -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+            try { Stop-CloudFolderService $serviceName 10 } catch {}
+            & sc.exe delete $serviceName | Out-Null
+        }
+        if ((Test-Path $InstalledExe) -and (Test-Path -LiteralPath $configPath)) {
+            & $InstalledExe cleanup $configPath 2>$null | Out-Null
+        }
+        Remove-Item -LiteralPath $mountDir -Recurse -Force -ErrorAction SilentlyContinue
+        if ((Test-Path -LiteralPath $cacheDir) -and -not (Get-ChildItem -LiteralPath $cacheDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $cacheDir -Force -ErrorAction SilentlyContinue
+        }
+        throw $failure
+    }
 
     Write-Host ''
     Write-Host "Ready: $localMountPoint" -ForegroundColor Green
@@ -828,7 +1195,7 @@ keep_files = 5
     Write-Host "Profile: $Profile" -ForegroundColor DarkGray
     Write-Host "It will reconnect automatically after crashes, network drops, and Windows restarts." -ForegroundColor DarkGray
     if ($Profile -eq 'Dev') {
-        Write-Host "Developer workflow: cd '$localMountPoint' then use cf here / cf run -- <command>." -ForegroundColor Cyan
+        Write-Host "Developer workflow: cd '$localMountPoint', run 'cf enter', then use normal git/python/test commands." -ForegroundColor Cyan
     }
     if (-not $NoOpen -and (Read-YesNo 'Open the folder now?' $true)) {
         Start-Process explorer.exe -ArgumentList ('"' + $localMountPoint + '"')
@@ -847,7 +1214,11 @@ function Show-Mounts {
         [pscustomobject]@{
             Name = [string]$record.name
             Status = $status
-            Remote = ("{0}@{1}:{2}{3}" -f $record.user,$record.host,$record.port,$record.remote_path)
+            Remote = if (-not [string]::IsNullOrWhiteSpace([string]$record.ssh_alias)) {
+                ("ssh:{0}{1}" -f $record.ssh_alias,$record.remote_path)
+            } else {
+                ("{0}@{1}:{2}{3}" -f $record.user,$record.host,$record.port,$record.remote_path)
+            }
             LocalFolder = [string]$record.mount_point
         }
     }

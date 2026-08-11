@@ -1,0 +1,23 @@
+[environment]
+# Optional shell wrapper. Common values: "bash -lc" or "zsh -lc".
+shell = "bash -lc"
+
+# Runs before every routed command, explicit remote command, and persistent job.
+# Keep secrets out of this file if the workspace is committed to Git.
+init = """
+source ~/.bashrc
+# conda activate isaaclab
+# module load cuda/12.4
+"""
+
+# Optional default profile. `cf env use <profile>` can select a local override
+# without rewriting this committed file.
+active = "default"
+
+[environment.profiles.default]
+init = ""
+
+[environment.profiles.gpu1]
+init = """
+export CUDA_VISIBLE_DEVICES=1
+"""

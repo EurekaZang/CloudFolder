@@ -22,7 +22,7 @@ jobs:
       - name: PowerShell 5.1 parse check
         shell: powershell
         run: |
-          $files = @('.\CloudFolder.ps1','.\cf.ps1','.\install.ps1','.\scripts\build.ps1','.\scripts\smoke-test.ps1','.\scripts\fault-test.ps1')
+          $files = @('.\CloudFolder.ps1','.\cf.ps1','.\install.ps1','.\scripts\build.ps1','.\scripts\smoke-test.ps1','.\scripts\fault-test.ps1','.\scripts\formal-gate.ps1','.\scripts\ssh-config-gate.ps1')
           foreach ($file in $files) {
             $tokens = $null
             $errors = $null
