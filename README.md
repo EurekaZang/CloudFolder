@@ -13,7 +13,7 @@
 
 CloudFolder 是一个面向 **AI Coding Agent + 远端 Linux 开发** 的 Windows Remote Workspace Layer。
 
-它把远端 SSH/SFTP 目录变成普通 Windows 路径，让 **Claude Code、Codex、VS Code、Explorer 以及任何本地程序**直接读写远端工作区；当 Git、测试、编译、包管理器或 Linux 工具应该在服务器上执行时，`cf run` 会自动把当前本地目录映射到对应的远端 Linux 目录，并在执行前后处理写回与缓存一致性。
+它把远端 SSH/SFTP 目录变成普通 Windows 路径，让 **Claude Code、Codex、VS Code、Explorer 以及任何本地程序**直接读写远端工作区；进入 `cf enter` 后，Git、Python、pytest、uv、cargo、编译器等 runtime 命令会透明路由到当前目录对应的远端 Linux cwd，而 `dir`、`explorer .`、`code .` 等本地工具继续留在 Windows。`cf run` / `cf sh` 仍保留给脚本和显式 remote exec。
 
 ```text
 远端 Linux：/home/alice/robotics
@@ -25,8 +25,8 @@ Windows：C:\Users\Alice\CloudFolder\Lab\robotics
        ┌────────────┴────────────┐
        │                         │
        ▼                         ▼
-Claude Code / Codex          cf run -- pytest -q
-本地读取、编辑文件              自动在远端同一 cwd 执行
+Claude Code / Codex          cf enter → pytest -q
+本地读取、编辑文件              普通命令自动在远端同一 cwd 执行
 ```
 
 **服务器端不需要安装 CloudFolder daemon，也不需要重新部署一套 Claude Code / Codex。** 只要服务器能正常 SSH/SFTP，CloudFolder 就能把它接进本地开发环境。
@@ -95,7 +95,7 @@ CloudFolder 为此提供一个 **Workspace Consistency Contract（工作区一�
 2. **确定 cwd 映射**：把本地相对目录确定性映射到该 mount 保存的绝对 Linux root；
 3. **Flush Barrier**：远端执行前等待 rclone VFS 的 queued / in-progress writes 清零；
 4. **Strict SSH Execution**：使用固定 key、`known_hosts` 和严格 host verification 执行；
-5. **Exit Code Preservation**：远端程序返回什么 exit code，`cf run` 就返回什么；
+5. **Exit Code Preservation**：routed command 与显式 `cf run` 都保留远端程序 exit code；
 6. **View Refresh**：执行完成后刷新 VFS 目录视图，让远端生成的 artifacts 回到本地可见状态。
 
 因此：
@@ -130,19 +130,21 @@ codex
 # 或
 claude
 
-# 看看 CloudFolder 如何理解当前工作区
-cf here
+# 进入 CloudFolder Remote Runtime
+cf enter
 
-# Git / test / build 在远端 Linux 的对应目录执行
+# 现在这些都是普通命令，但执行发生在远端 Linux 的对应 cwd
+git status
+pytest -q
+cargo test
+
+# explorer / code 仍然是本地 Windows 工具
+explorer .
+code .
+
+# 脚本或 shell syntax 仍可显式使用 legacy API
 cf run -- git status
-cf run -- pytest -q
-cf run -- cargo test
-
-# shell operators / pipeline / compound commands
 cf sh -- "git status && pytest -q"
-
-# 直接进入对应远端 cwd 的交互式 shell
-cf shell
 ```
 
 如果你当前位于：
@@ -157,10 +159,10 @@ C:\Users\Alice\CloudFolder\Lab\robotics\src
 /home/alice/projects
 ```
 
-那么：
+在 `cf enter` 里运行：
 
 ```powershell
-cf run -- pwd
+pwd
 ```
 
 会在远端对应的：
@@ -172,6 +174,104 @@ cf run -- pwd
 中执行。
 
 **你不再需要在“本地文件路径”和“远端 shell 路径”之间自己做 mental mapping。**
+
+---
+
+# v0.7：Local Workspace / Remote Runtime
+
+v0.7 把 CloudFolder 从“稳定挂载 + `cf run`”推进成完整的 **Local Workspace / Remote Runtime abstraction**。
+
+## 1. Execution Router —— 进入后忘掉 `cf run`
+
+```powershell
+cd (cf path Lab)
+cf enter
+
+git status
+python train.py
+pytest -q
+uv sync
+```
+
+`cf enter` 会把一组明确的 remote runtime tool shim 放到当前 session 的 PATH 前面。Git、Python、pytest、uv、pip、conda、cargo、cmake、node、npm、rg、find、bash、nvidia-smi 等会自动经过 CloudFolder 的 flush barrier、cwd mapping、SSH execution 和 VFS refresh；`cd`、`dir`、`explorer`、`code` 仍走本地。
+
+**Formal Gate：**真实远端 workspace 已完成 `git → 本地 edit → test → add → commit`，全程只使用普通 `git` / `python` 命令，**0 次主动 `cf run`**。
+
+## 2. Workspace Environment —— Conda / module / CUDA 配一次
+
+在 workspace 根目录放置 `.cloudfolder.toml`：
+
+```toml
+[environment]
+shell = "bash -lc"
+init = """
+source ~/.bashrc
+"""
+
+[environment.profiles.isaaclab]
+init = """
+conda activate isaaclab
+module load cuda/12.4
+export CUDA_VISIBLE_DEVICES=1
+"""
+```
+
+然后：
+
+```powershell
+cf env
+cf env use isaaclab
+cf env reload
+```
+
+基础 `init` 与当前 profile 会自动应用到 routed command、显式 `cf run` / `cf sh`、`cf shell` 和 persistent job。`cf env use` 只保存本机选择，不会重写已提交的 `.cloudfolder.toml`。模板见 [`config/workspace.toml.example`](config/workspace.toml.example)。
+
+## 3. Persistent Jobs —— 电脑断线，远端任务继续
+
+```powershell
+cf job run -- python train.py
+cf job list
+cf job logs cf-a83f
+cf job logs -f cf-a83f
+cf job attach cf-a83f
+cf job stop cf-a83f
+```
+
+第一版使用远端 `setsid + nohup` 与 `~/.cloudfolder/jobs/` 元数据。启动后本地 SSH / CloudFolder / 电脑退出都不会结束任务，重新连接后仍能恢复状态和日志。`attach` 当前是对 durable live log 的重新附着，不是通用 interactive stdin 恢复；Slurm/PBS 资源调度仍交给 scheduler。
+
+## 4. Port Forwarding —— Jupyter / TensorBoard 不再手写 `ssh -L`
+
+```powershell
+cf forward 8888
+cf forward 6006
+cf forward list
+cf forward stop 8888
+cf forward stop all
+```
+
+如果本机同端口已占用，CloudFolder 会自动选择可用 local port，并打印可直接打开的 `http://127.0.0.1:<port>/`。当前是显式 forwarding；还没有通过任意应用 stdout 自动猜端口。
+
+## 5. SSH Config / ProxyJump —— `ssh <host>` 能连，CloudFolder 就接管
+
+已有：
+
+```sshconfig
+Host h100
+    HostName 10.0.0.23
+    User zang
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyJump gateway
+```
+
+直接：
+
+```powershell
+cf add h100
+```
+
+CloudFolder 会复用 Windows OpenSSH 解析后的 Host、User、Port、IdentityFile、CertificateFile、known_hosts、ProxyJump / ProxyCommand 等信息。后台 LocalSystem mount 不会直接读取用户私钥；安装时会为该 mount 生成 **SYSTEM-safe SSH snapshot**，只复制实际需要的 SSH material，并用 SYSTEM / Administrators ACL 封闭。
+
+**Formal Gate：**已用真实 `22 → ProxyJump → 6000` 链路验证：`ssh <alias>` 成功后，`cf add <alias>` 能由 LocalSystem 创建 `Running / Mounted / PendingWrites=0` 的 SFTP mount。
 
 ---
 
@@ -496,6 +596,17 @@ cf list
 cf path <mount>
 cf here
 cf status [mount]
+cf enter [mount]
+cf env [use <profile>|reload]
+cf job run [mount] -- <program> [args...]
+cf job list [mount]
+cf job logs [-f] <job> [--mount <mount>]
+cf job attach <job> [--mount <mount>]
+cf job stop <job> [--mount <mount>]
+cf forward <remote-port> [local-port] [--mount <mount>]
+cf forward list [mount]
+cf forward stop <local-port|all> [--mount <mount>]
+cf add <ssh-config-host>
 cf flush [mount]
 cf refresh [mount]
 cf run [mount] -- <program> [args...]
@@ -543,6 +654,60 @@ cf status
 cf status Lab
 ```
 
+## `cf enter`
+
+进入透明 Remote Runtime session：
+
+```powershell
+cf enter Lab
+git status
+pytest -q
+```
+
+从 mount 内执行 `cf enter` 时 mount 名可以省略。这个 session 中 remote runtime tool 自动路由，Windows 本地工具保持本地。
+
+## `cf env`
+
+查看或选择 `.cloudfolder.toml` 环境 profile：
+
+```powershell
+cf env
+cf env use isaaclab
+cf env reload
+```
+
+## `cf job`
+
+持久远端任务：
+
+```powershell
+cf job run -- python train.py
+cf job list
+cf job logs -f <job>
+cf job attach <job>
+cf job stop <job>
+```
+
+## `cf forward`
+
+建立与管理 SSH local forwarding：
+
+```powershell
+cf forward 8888
+cf forward 6006 16006
+cf forward list
+cf forward stop 8888
+cf forward stop all
+```
+
+## `cf add <ssh-config-host>`
+
+直接采用现有 OpenSSH config host，包括 ProxyJump / ProxyCommand 等 OpenSSH 行为：
+
+```powershell
+cf add h100
+```
+
 ## `cf flush`
 
 等待当前 VFS pending upload 清零：
@@ -561,7 +726,7 @@ cf refresh
 
 ## `cf run`
 
-用于**不需要 shell 解析**的程序 + argv：
+兼容保留的显式 remote-exec API，用于脚本、CI、未列入 Router 的第三方 CLI，或你明确希望绕过透明路由时。普通交互式开发优先 `cf enter`。
 
 ```powershell
 cf run -- git status
@@ -617,6 +782,8 @@ CloudFolder 会维护：
 ```
 
 中的 CloudFolder managed block。
+
+v0.7 的 managed block 会优先建议从 `cf enter` 启动 Agent/terminal；在该 session 中直接使用普通 Git / Python / build / test 命令。`cf run` / `cf sh` 仍用于显式 remote exec 与 shell syntax。
 
 这段规则会告诉 Agent：
 
@@ -889,7 +1056,11 @@ CloudFolder 目前主动保持 scope 很窄。
 - 一键 Manager 当前主要配置 **SFTP**；rclone 支持更多 backend，但还没有全部暴露进小白 UI；
 - CloudFolder 是 **live remote filesystem**，不是离线同步盘；
 - 网络延迟和服务器性能仍然存在；
-- 直接在 mount 上执行 Git、package manager、cold repository-wide scan 可能很慢，优先用 `cf run`；
+- 在 **`cf enter` 之外**直接对 mount 执行本地 Git、package manager 或 cold repository-wide scan 仍可能很慢；优先从 `cf enter` 启动 terminal / Agent / `code .`；
+- Execution Router 当前使用明确的 remote-runtime tool shim 列表，不会猜测任意 EXE；未列入 Router 的 CLI 可显式使用 `cf run -- <tool>`；
+- Persistent Jobs 当前基于 `setsid + nohup`；`cf job attach` 是 durable log attach，不是任意交互式 stdin 恢复；Slurm/PBS 等 scheduler workload 仍由 scheduler 管理；
+- `cf forward` 当前是显式端口转发，不会自动分析任意程序 stdout 来发现端口；
+- `cf add <ssh-host>` 的无人值守 SFTP service 要求最终认证能够使用可复制的 key/certificate material；仅依赖交互密码或仅存在于用户 ssh-agent 的密钥不能直接变成 LocalSystem mount；
 - POSIX permission / ownership 无法总是完美映射成 Windows filesystem semantics；
 - 当前 rclone SFTP projection 不会把 Linux symlink identity 完整呈现为原生 Windows symlink；
 - 当前 Release **尚未 Authenticode code-sign**，Windows SmartScreen 可能显示 unknown publisher；Release 同时提供 SHA-256 checksum；
@@ -911,19 +1082,22 @@ CloudFolder 本身不需要在服务器安装 daemon。普通能登录并对目�
 
 ## 为什么不用本地 `git status`？
 
-可以运行，但在冷 cache、大仓库或大量 objects 的情况下，Git 的 metadata / small-file fan-out 很容易把网络 round-trip 放大。推荐：
+可以运行，但在冷 cache、大仓库或大量 objects 的情况下，Git 的 metadata / small-file fan-out 很容易把网络 round-trip 放大。交互式开发推荐：
 
 ```powershell
-cf run -- git status
+cf enter
+git status
 ```
 
-## `cf run` 会不会看不到刚保存的文件？
+脚本和 legacy 自动化仍可使用 `cf run -- git status`。
 
-它会在远端执行前等待 VFS pending writes 清零；这正是 Workspace Consistency Contract 的一部分。
+## `cf enter` 里的普通命令会不会看不到刚保存的文件？
+
+routed command 会在远端执行前等待 VFS pending writes 清零；显式 `cf run` 也使用同一个 barrier。这正是 Workspace Consistency Contract 的一部分。
 
 ## 远端命令生成文件后本地看不到怎么办？
 
-`cf run` 完成后会触发 VFS refresh。也可以手动：
+routed command 与 `cf run` 完成后都会触发 VFS refresh。也可以手动：
 
 ```powershell
 cf refresh

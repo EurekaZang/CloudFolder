@@ -13,7 +13,7 @@
 
 CloudFolder is a Windows **Remote Workspace Layer for AI coding agents and Linux development**.
 
-It exposes a remote SSH/SFTP directory as an ordinary Windows path that Claude Code, Codex, VS Code, Explorer, and other local applications can read and edit. When Git, tests, builds, package managers, or Linux tooling should execute on the server, `cf run` maps the current local directory to the matching remote Linux directory and coordinates write-back before and cache refresh after the command.
+It exposes a remote SSH/SFTP directory as an ordinary Windows path that Claude Code, Codex, VS Code, Explorer, and other local applications can read and edit. Enter that workspace with `cf enter` and Git, tests, builds, package managers, Python, and common Linux tooling are transparently routed to the matching remote Linux cwd, while local tools such as Explorer and `code .` stay local.
 
 ```text
 Remote Linux: /home/alice/robotics
@@ -95,7 +95,7 @@ CloudFolder therefore defines a **Workspace Consistency Contract**:
 2. **Map the cwd** — deterministically map the local relative path onto the saved absolute Linux root.
 3. **Flush barrier** — wait for queued/in-progress rclone VFS writes to reach zero before remote execution.
 4. **Strict SSH execution** — use the pinned key, `known_hosts`, and strict host verification.
-5. **Preserve exit status** — `cf run` returns the remote program's exit code.
+5. **Preserve exit status** — routed commands and explicit `cf run` return the remote program's exit code.
 6. **Refresh the view** — invalidate the VFS directory view after execution so remote-generated artifacts appear locally.
 
 > **The key CloudFolder feature is not “SFTP also mounts.” It is making the local filesystem plane and remote execution plane behave like one development workspace.**
@@ -122,24 +122,21 @@ Then:
 # Enter a remote project through an ordinary Windows path.
 cd (cf path Lab)
 cd robotics
+cf enter
 
-# The coding agent still runs on Windows.
+# Runtime commands transparently execute on remote Linux in the matching cwd.
+git status
+pytest -q
+cargo test
+
+# Local Windows applications still stay local and inherit the routed session.
+code .
 codex
 # or: claude
 
-# See how CloudFolder maps this working directory.
-cf here
-
-# Git / tests / builds execute on remote Linux in the matching cwd.
+# Explicit APIs remain available for scripts and shell syntax.
 cf run -- git status
-cf run -- pytest -q
-cf run -- cargo test
-
-# Shell operators / pipelines / compound commands.
 cf sh -- "git status && pytest -q"
-
-# Open an interactive login shell at the same mapped remote cwd.
-cf shell
 ```
 
 If Windows cwd is:
@@ -154,10 +151,10 @@ and the mount's remote root is:
 /home/alice/projects
 ```
 
-then:
+then plain routed:
 
 ```powershell
-cf run -- pwd
+bash -lc pwd
 ```
 
 runs in:
@@ -167,6 +164,111 @@ runs in:
 ```
 
 No manual mental mapping between a Windows project path and a remote shell path.
+
+---
+
+# v0.7: Local Workspace / Remote Runtime
+
+CloudFolder v0.7 completes the abstraction that the mount alone could not provide: **files are locally addressable, but the workspace runtime is remote by default**.
+
+## 1. Execution Router — stop thinking about `cf run`
+
+```powershell
+cf enter GPU-Server
+
+git status
+uv sync
+pytest -q
+python train.py
+cargo test
+rg "TODO"
+```
+
+`cf enter` starts a local PowerShell with native `cf.exe` hardlink shims for Git, Python, test runners, package managers, compilers, build tools, and common Linux utilities. Windows argv and Unicode are preserved without rebuilding commands as shell strings. `dir`, `cd`, `explorer .`, `code .`, and other local tools are not routed.
+
+Every routed command still follows the Workspace Consistency Contract: flush pending VFS writes → map Windows cwd to Linux cwd → load the workspace environment → execute remotely → preserve the exit code → refresh the local view.
+
+**Formal Gate:** a fresh workspace completed `git status → local edit → test → git add → git commit` using only ordinary `git` / `python` commands and **zero proactive `cf run` commands**.
+
+## 2. Workspace Environment — configure Conda / modules / CUDA once
+
+Put `.cloudfolder.toml` at the project root:
+
+```toml
+[environment]
+shell = "bash -lc"
+init = """
+source ~/.bashrc
+conda activate isaaclab
+module load cuda/12.4
+"""
+
+[environment.profiles.gpu1]
+init = """
+export CUDA_VISIBLE_DEVICES=1
+"""
+```
+
+Then:
+
+```powershell
+cf env
+cf env use gpu1
+cf env reload
+```
+
+The base `init` plus the selected profile are applied to routed commands, explicit `cf run` / `cf sh`, `cf shell`, and persistent jobs. `cf env use` stores a local selection and does not rewrite the committed project config. See [`config/workspace.toml.example`](config/workspace.toml.example).
+
+## 3. Persistent Jobs — remote compute survives the laptop
+
+```powershell
+cf job run -- python train.py
+cf job list
+cf job logs cf-a83f1234
+cf job logs -f cf-a83f1234
+cf job attach cf-a83f1234
+cf job stop cf-a83f1234
+```
+
+Job PID, cwd, command, state, and logs live remotely under `~/.cloudfolder/jobs/`. The first backend uses `setsid + nohup` (falling back to `nohup`), so losing SSH, restarting CloudFolder, or shutting down the local PC does not terminate the remote task. `attach` currently reconnects to the durable live log stream; it does not pretend arbitrary interactive stdin can be reconstructed.
+
+## 4. Port Forwarding — Jupyter without hand-written `ssh -L`
+
+```powershell
+# Jupyter is listening on remote 127.0.0.1:8888
+cf forward 8888
+
+cf forward list
+cf forward stop 8888
+```
+
+If the same local port is busy, CloudFolder chooses a free loopback port and prints the final endpoint. Tunnels bind to `127.0.0.1`, run in an independent OpenSSH process, and persist local PID/port state. Before stopping a tunnel, CloudFolder verifies the process command line so a recycled PID cannot kill an unrelated process.
+
+## 5. Native SSH Config / ProxyJump — adopt the connection you already use
+
+Given:
+
+```sshconfig
+Host h100
+    HostName 10.0.0.23
+    User zang
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyJump gateway
+```
+
+use:
+
+```powershell
+cf add h100
+```
+
+Foreground CloudFolder commands keep Windows OpenSSH responsible for aliases, `ProxyJump`, `ProxyCommand`, custom user/port, identities, certificates, `known_hosts`, and `Include`. The background LocalSystem SFTP mount freezes the `ssh -G`-resolved target/jump chain into a mount-private SYSTEM-safe snapshot instead of weakening the user's original private-key permissions.
+
+> **Formal Gate: If `ssh <host>` works, `cf add <host>` should work.**
+
+The live gate used the port-22 machine as a bastion and reached the port-6000 `eureka` host through `ProxyJump`; the LocalSystem service reached `Running / Mounted / PendingWrites=0`, survived a runtime upgrade with its private-key ACL still restricted to SYSTEM + Administrators, and was then removed cleanly.
+
+Unattended service startup must still succeed in OpenSSH `BatchMode`. CloudFolder does not store password-only credentials or credentials that exist only in a transient interactive agent session.
 
 ---
 
@@ -205,11 +307,11 @@ CloudFolder deliberately splits the work:
 | Targeted reads/edits | Local CloudFolder path |
 | Create/rename/delete files | Local CloudFolder path |
 | Small targeted search | Local or remote |
-| Git | `cf run -- git ...` |
-| pytest / cargo / cmake / npm / uv | `cf run -- ...` |
-| Repository-wide `rg` / `find` | `cf run -- rg ...` |
-| Scripts tied to server environments | `cf run -- ...` |
-| Pipelines / redirects | `cf sh -- "..."` |
+| Git | Plain `git ...` inside `cf enter` |
+| pytest / cargo / cmake / npm / uv | Plain commands inside `cf enter` |
+| Repository-wide `rg` / `find` | Plain routed `rg` / `find` inside `cf enter` |
+| Scripts tied to server environments | Routed commands, or explicit `cf run -- ...` outside an entered session |
+| Pipelines / redirects | Routed shell or explicit `cf sh -- "..."` |
 
 This is not a workaround around the filesystem. It is an explicit acknowledgment that **SFTP network semantics are not local NVMe semantics**.
 
@@ -240,7 +342,7 @@ Existing user instructions are preserved.
 
 The rule becomes simple:
 
-> **Edit through the local filesystem. Run Git/build/test/repository-wide operations through `cf run`. Do not start a second coding agent remotely just for this workspace.**
+> **Start the agent from `cf enter`, edit through the local filesystem, and use ordinary Git/build/test/repository-wide commands. Do not start a second coding agent remotely just for this workspace.**
 
 ---
 
@@ -252,7 +354,7 @@ The difference is the **product abstraction**.
 
 | Solution | What it is best at | File presentation | Command execution | Local-agent model | Main trade-off |
 |---|---|---|---|---|---|
-| **CloudFolder** | **Agent-native remote workspace** | Ordinary Windows path | `cf run` maps automatically to the same remote cwd | **Agent stays local; files are locally addressable; heavy work stays remote** | Beginner UI is currently focused on Windows + SFTP |
+| **CloudFolder** | **Agent-native remote workspace** | Ordinary Windows path | `cf enter` transparently routes runtime tools to the same remote cwd; `cf run` remains explicit fallback | **Agent stays local; files are locally addressable; heavy work stays remote** | Beginner UI is currently focused on Windows + SFTP |
 | [SSHFS-Win](https://github.com/winfsp/sshfs-win) | SSHFS mounting on Windows | Windows drive / UNC | User manages SSH separately | Local agent can see the mount; execution plane is left to the user | Officially a minimal SSHFS port; developer workflow orchestration is not its purpose |
 | [rclone mount + WinFsp](https://rclone.org/commands/rclone_mount/) | General remote/VFS mount engine | Windows filesystem | User designs the execution path | Can provide the file plane, but cwd bridge, flush contract, service lifecycle, and agent policy are separate work | Powerful and flexible infrastructure rather than an opinionated developer product |
 | [RaiDrive](https://docs.raidrive.com/en/) / [ExpanDrive](https://docs.expandrive.com/integrations/sftp) / [Mountain Duck](https://docs.cyberduck.io/mountainduck/) | Polished cloud/SFTP desktop mounting | Explorer / drive / integrated folder | Mapped-cwd remote developer execution is not their core abstraction | Excellent general file-access products | CloudFolder is narrower and specifically couples coding-agent file access to Linux execution |
@@ -269,7 +371,7 @@ SSHFS-Win is already a direct, mature answer.
 
 CloudFolder targets a more specific workflow:
 
-> “Let my local agent treat a Linux project as a local workspace, automatically send Git/Linux/toolchain commands back to the exact remote cwd, and keep the mount alive as infrastructure.”
+> “Let my local agent treat a Linux project as a local workspace, transparently route Git/Linux/toolchain commands back to the exact remote cwd, and keep the mount alive as infrastructure.”
 
 CloudFolder is not meant to replace every SSHFS-Win use case. It targets a higher-level **remote development / local agent** workflow.
 
@@ -320,7 +422,7 @@ Windows CloudFolder path
 actual remote files
 
 Local Agent
-      ↕ cf run
+      ↕ cf enter / Execution Router
 actual remote Linux toolchain
 ```
 
@@ -456,6 +558,12 @@ cf list
 cf path <mount>
 cf here
 cf status [mount]
+cf enter [mount]
+cf env [use <profile>|reload]
+cf job run|list|logs|attach|stop ...
+cf forward <remote-port> [local-port]
+cf forward list|stop ...
+cf add <ssh-config-host>
 cf flush [mount]
 cf refresh [mount]
 cf run [mount] -- <program> [args...]
@@ -484,6 +592,26 @@ Resolve the current mount, local root/cwd, and matching remote cwd.
 
 Show service state, mount state, pending writes, local root, and remote root.
 
+### `cf enter [mount]`
+
+Enter the Local Workspace / Remote Runtime session. Common runtime tools become transparent remote commands; local Windows tools stay local.
+
+### `cf env [use <profile>|reload]`
+
+Inspect or select the `.cloudfolder.toml` workspace environment used by routed commands, explicit remote commands, shells, and persistent jobs.
+
+### `cf job ...`
+
+Run and recover detached remote jobs. State and logs live under remote `~/.cloudfolder/jobs/`.
+
+### `cf forward ...`
+
+Create/list/stop localhost SSH tunnels for Jupyter, TensorBoard, Gradio, debuggers, databases, and similar services.
+
+### `cf add <ssh-config-host>`
+
+Adopt an existing Windows OpenSSH config alias, including ProxyJump/ProxyCommand paths. Formal Gate: if `ssh <host>` works non-interactively, `cf add <host>` should work.
+
 ### `cf flush [mount]`
 
 Wait until VFS queued/in-progress writes are zero.
@@ -492,9 +620,9 @@ Wait until VFS queued/in-progress writes are zero.
 
 Invalidate the VFS directory view.
 
-### `cf run [mount] -- <program> [args...]`
+### `cf run [mount] -- <program> [args...]` — explicit/legacy API
 
-Use for a program + native argv without shell parsing:
+Use outside `cf enter`, or when a script intentionally wants explicit remote execution with native argv and no shell parsing:
 
 ```powershell
 cf run -- git status
@@ -546,10 +674,10 @@ CloudFolder updates only its managed block in:
 It teaches the agents to:
 
 - edit through normal local filesystem tools;
-- use `cf here` to detect a CloudFolder workspace;
-- use `cf run` for Git/build/test/package managers/compilers/interpreters;
-- prefer remote `rg` / `find` for cold repository-wide scans;
-- use `cf sh` for shell syntax;
+- start from `cf enter` when possible;
+- use ordinary routed Git/build/test/package-manager/compiler/interpreter commands;
+- keep repository-wide `rg` / `find` on the remote runtime;
+- use explicit `cf run` / `cf sh` only when scripting or bypassing the entered-session routing model;
 - avoid launching a second remote coding agent solely for this workspace.
 
 This is explicitly opt-in. Existing instructions are preserved.
@@ -572,23 +700,31 @@ flowchart LR
     S[SFTP]
     L[Remote Linux Files]
     C[cf.exe]
+    E[Execution Router]
+    ENV[.cloudfolder.toml]
+    J[Persistent Jobs]
+    F[Port Forwarding]
     SSH[Windows OpenSSH]
     T[Remote Linux Toolchain]
     SV[CloudFolderService.exe]
 
     A -->|normal file I/O| P
     P --> W --> R --> S --> L
-    A -->|Git / test / build| C
-    C -->|flush + cwd mapping| SSH --> T
+    A -->|plain Git / test / build after cf enter| E --> C
+    ENV --> C
+    C -->|flush + cwd mapping + env| SSH --> T
+    C --> J
+    C --> F
     SV -. supervise / health / recover .-> R
     C -. refresh VFS .-> R
 ```
 
 ```text
 Data plane:       Windows path → WinFsp → rclone VFS → SFTP → remote files
-Execution plane:  local cwd → cf.exe → SSH → matching Linux cwd
+Execution plane:  cf enter → routed tool → cf.exe → SSH → matching Linux cwd
 Control plane:    CloudFolderService → health / restart / backoff / cleanup
-Agent plane:      Claude/Codex guidance → choose local I/O or remote execution
+Runtime plane:    .cloudfolder.toml + persistent jobs + localhost forwards
+Agent plane:      Claude/Codex guidance → local file I/O + transparent remote runtime
 ```
 
 ---
@@ -624,7 +760,7 @@ Current mount supervision includes:
 - Cache maximum: `8 GiB`
 - Minimum free space: `5 GiB`
 - Developer write-back: `1s`
-- `cf run`: explicit flush barrier still applies
+- Routed commands, explicit remote commands, and job startup all use the flush barrier
 - Concurrent VFS uploads: `8`
 - Health probe: every `10s`
 - Probe timeout: `5s`
@@ -648,7 +784,7 @@ and restart the matching `CloudFolder.<name>` service.
 
 Before installing the public key, Windows OpenSSH shows the server fingerprint. Later connections use strict host checking and the mount's explicit `known_hosts` metadata.
 
-`cf run`, `cf sh`, and `cf shell` use the same strict SSH identity information.
+Routed commands, `cf run`, `cf sh`, `cf shell`, jobs, and forwards use the same strict SSH identity information. SSH Config mounts additionally use a mount-private SYSTEM-safe service snapshot for the background SFTP process.
 
 ## Password handling
 
@@ -683,7 +819,7 @@ low fan-out / editing I/O  → local filesystem path
 high fan-out / compute     → remote execution
 ```
 
-That is why `cf run` is a core feature rather than an SSH shortcut added on the side.
+That is why **remote execution locality** is a core feature rather than an SSH shortcut added on the side. In v0.7 the normal interactive form is transparent routing through `cf enter`; `cf run` remains the explicit API.
 
 ---
 
@@ -749,7 +885,11 @@ CloudFolder keeps its scope intentionally narrow today.
 - The beginner-friendly manager currently focuses on **SFTP**. rclone supports many more backends, but they are not all exposed in the simple UI.
 - CloudFolder is a **live remote filesystem**, not an offline synchronization mirror.
 - Network and server latency still exist.
-- Git, package managers, and cold repository-wide scans can be slow directly on the mount; prefer `cf run`.
+- Git, package managers, and cold repository-wide scans can still be slow if executed by a process that did not inherit the Execution Router. Start terminals, coding agents, and `code .` from `cf enter`; use explicit `cf run` / `cf sh` as the fallback for unlisted third-party CLIs and automation.
+- The Execution Router deliberately uses an explicit runtime-tool shim set rather than guessing every executable.
+- Persistent Jobs currently use `setsid + nohup`; `cf job attach` follows durable logs and does not restore arbitrary interactive stdin. Scheduler-managed HPC jobs should still use Slurm/PBS/etc.
+- `cf forward` is explicit port forwarding. It does not yet parse arbitrary application stdout to auto-discover ports.
+- SSH Config / ProxyJump mounts require credentials that work for unattended OpenSSH `BatchMode`; CloudFolder does not persist password-only or transient agent-only credentials.
 - POSIX permissions/ownership cannot always map perfectly to Windows filesystem semantics.
 - The current rclone SFTP projection does not preserve Linux symlink identity as native Windows symlinks.
 - Releases are currently **not Authenticode-signed**, so Windows SmartScreen may show an unknown-publisher warning. SHA-256 checksum files are released with the ZIP.
@@ -769,21 +909,24 @@ No. The Windows path is a live view of the remote filesystem. rclone VFS uses lo
 
 No CloudFolder daemon is installed remotely. A normal SSH/SFTP account with permission to the target directory is enough. Initial public-key authorization requires the account to be able to use its SSH authorized-keys environment normally.
 
-### Why not run local `git status` on the mount?
+### Why not run a Windows `git.exe` directly on the mount?
 
-You can, but metadata-heavy Git access can be slow on a cold network filesystem. Prefer:
+You can, but metadata-heavy Git access can be slow on a cold network filesystem. Enter the routed runtime first:
 
 ```powershell
-cf run -- git status
+cf enter
+git status
 ```
 
-### Can `cf run` miss a file I just saved?
+For scripts that intentionally stay outside `cf enter`, `cf run -- git status` remains supported.
+
+### Can a routed command or `cf run` miss a file I just saved?
 
 It waits for VFS queued/in-progress writes to drain before starting remote execution. That is part of the Workspace Consistency Contract.
 
 ### What if a remote command creates files and I cannot see them locally yet?
 
-`cf run` refreshes the VFS view after execution. You can also run:
+Routed commands and `cf run` refresh the VFS view after execution. You can also run:
 
 ```powershell
 cf refresh

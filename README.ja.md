@@ -13,7 +13,7 @@
 
 CloudFolder は、**AI Coding Agent + リモート Linux 開発**のための Windows Remote Workspace Layer です。
 
-リモートの SSH/SFTP ディレクトリを通常の Windows パスとして公開し、Claude Code、Codex、VS Code、Explorer、その他のローカルアプリから直接読み書きできます。Git、テスト、ビルド、パッケージマネージャー、Linux ツールをサーバー側で実行すべきときは、`cf run` が現在のローカルディレクトリを対応する Linux cwd に自動マッピングし、実行前の書き戻しと実行後のキャッシュ更新まで調整します。
+リモートの SSH/SFTP ディレクトリを通常の Windows パスとして公開し、Claude Code、Codex、VS Code、Explorer、その他のローカルアプリから直接読み書きできます。`cf enter` に入ると Git、Python、pytest、uv、cargo、compiler などの runtime command は現在の local cwd に対応する remote Linux cwd へ透明に route され、`dir`、`explorer .`、`code .` などは Windows local のままです。`cf run` / `cf sh` は script や explicit remote exec 用に残ります。
 
 ```text
 Remote Linux: /home/alice/robotics
@@ -95,7 +95,7 @@ CloudFolder はそのために **Workspace Consistency Contract** を提供し�
 2. **cwd mapping** — local relative path を保存済みの absolute Linux root に決定的に対応付ける。
 3. **Flush barrier** — remote 実行前に rclone VFS の queued / in-progress writes が 0 になるまで待つ。
 4. **Strict SSH execution** — 専用 key、`known_hosts`、strict host verification を使う。
-5. **Exit code preservation** — remote program の exit code をそのまま `cf run` の exit code にする。
+5. **Exit code preservation** — routed command と explicit `cf run` の両方で remote program の exit code を保持する。
 6. **View refresh** — 実行後に VFS view を更新して、remote artifact を local から見えるようにする。
 
 > **CloudFolder のコアは「SFTP を mount できること」ではなく、local filesystem plane と remote execution plane を 1 つの development workspace にすることです。**
@@ -127,19 +127,21 @@ cd robotics
 codex
 # または: claude
 
-# local cwd と remote cwd の対応を確認
-cf here
+# CloudFolder Remote Runtime に入る
+cf enter
 
-# Git / test / build は remote Linux の対応 cwd で実行
+# 普通の command のまま remote Linux の対応 cwd で実行
+git status
+pytest -q
+cargo test
+
+# Windows tool は local のまま
+explorer .
+code .
+
+# script / shell syntax では explicit API も利用可能
 cf run -- git status
-cf run -- pytest -q
-cf run -- cargo test
-
-# && / pipe / redirect など shell syntax が必要な場合
 cf sh -- "git status && pytest -q"
-
-# 対応 remote cwd で interactive login shell
-cf shell
 ```
 
 現在の Windows cwd が：
@@ -154,10 +156,10 @@ mount の remote root が：
 /home/alice/projects
 ```
 
-なら：
+`cf enter` 内で：
 
 ```powershell
-cf run -- pwd
+pwd
 ```
 
 は remote の：
@@ -169,6 +171,72 @@ cf run -- pwd
 で実行されます。
 
 **Windows path と remote shell path の mental mapping を自分で維持する必要がありません。**
+
+---
+
+# v0.7：Local Workspace / Remote Runtime
+
+v0.7 では CloudFolder を「安定した mount + `cf run`」から、完全な **Local Workspace / Remote Runtime abstraction** へ進化させました。
+
+## 1. Execution Router
+
+```powershell
+cd (cf path Lab)
+cf enter
+git status
+python train.py
+pytest -q
+uv sync
+```
+
+Git、Python、pytest、uv、pip、conda、cargo、cmake、node、npm、rg、find、bash、nvidia-smi などは自動的に flush barrier → cwd mapping → SSH execution → VFS refresh を通ります。`cd` / `dir` / `explorer` / `code` は local Windows のままです。
+
+**Formal Gate:** 実 remote workspace で `git → local edit → test → add → commit` を普通の `git` / `python` command のみで完了し、proactive `cf run` は **0 回**でした。
+
+## 2. Workspace Environment
+
+`.cloudfolder.toml` で shell / init / profile を定義し、`cf env use isaaclab` で Conda、module、CUDA env を一度選択できます。base init + active profile は routed command、`cf run` / `cf sh`、`cf shell`、persistent job に共通適用されます。例は [`config/workspace.toml.example`](config/workspace.toml.example)。
+
+```powershell
+cf env
+cf env use isaaclab
+cf env reload
+```
+
+## 3. Persistent Jobs
+
+```powershell
+cf job run -- python train.py
+cf job list
+cf job logs -f <job>
+cf job attach <job>
+cf job stop <job>
+```
+
+`setsid + nohup` と `~/.cloudfolder/jobs/` を使い、local SSH / CloudFolder / PC が終了しても job は remote で継続します。`attach` は durable live log への再接続で、generic interactive stdin recovery ではありません。Slurm/PBS workload は scheduler を使ってください。
+
+## 4. Port Forwarding
+
+```powershell
+cf forward 8888
+cf forward 6006
+cf forward list
+cf forward stop 8888
+```
+
+Jupyter / TensorBoard / Gradio 等を raw `ssh -L` なしで localhost に公開できます。local port が使用中なら空き port を自動選択します。
+
+## 5. SSH Config / ProxyJump
+
+既存の `~/.ssh/config` host をそのまま採用できます。
+
+```powershell
+cf add h100
+```
+
+HostName、User、Port、IdentityFile、CertificateFile、known_hosts、ProxyJump / ProxyCommand を Windows OpenSSH から解決します。LocalSystem mount は user private key を直接使わず、mount ごとの **SYSTEM-safe SSH snapshot** を作成します。
+
+**Formal Gate:** 実際の `22 → ProxyJump → 6000` 経路で、`ssh <alias>` 成功後に `cf add <alias>` が `Running / Mounted / PendingWrites=0` の LocalSystem SFTP mount を作成することを確認済みです。
 
 ---
 
@@ -451,6 +519,17 @@ cf list
 cf path <mount>
 cf here
 cf status [mount]
+cf enter [mount]
+cf env [use <profile>|reload]
+cf job run [mount] -- <program> [args...]
+cf job list [mount]
+cf job logs [-f] <job> [--mount <mount>]
+cf job attach <job> [--mount <mount>]
+cf job stop <job> [--mount <mount>]
+cf forward <remote-port> [local-port] [--mount <mount>]
+cf forward list [mount]
+cf forward stop <local-port|all> [--mount <mount>]
+cf add <ssh-config-host>
 cf flush [mount]
 cf refresh [mount]
 cf run [mount] -- <program> [args...]
@@ -475,6 +554,29 @@ cd (cf path Lab)
 ### `cf status [mount]`
 service state、mount state、pending writes、local root、remote root を表示。
 
+### `cf enter [mount]`
+Transparent Remote Runtime session を開きます。
+
+```powershell
+cf enter Lab
+git status
+pytest -q
+```
+
+Remote runtime tool は自動 route、Windows local tool は local のままです。
+
+### `cf env [use <profile>|reload]`
+`.cloudfolder.toml` の environment / profile を確認・選択します。
+
+### `cf job ...`
+Detached persistent remote job の run / list / logs / attach / stop を提供します。
+
+### `cf forward ...`
+SSH local forwarding の start / list / stop を提供します。
+
+### `cf add <ssh-config-host>`
+既存 OpenSSH config host を CloudFolder mount として採用します。ProxyJump / ProxyCommand も OpenSSH の解決結果を利用します。
+
 ### `cf flush [mount]`
 VFS queued/in-progress writes が 0 になるまで待機。
 
@@ -482,7 +584,7 @@ VFS queued/in-progress writes が 0 になるまで待機。
 VFS directory view を invalidate / refresh。
 
 ### `cf run [mount] -- <program> [args...]`
-Shell parsing が不要な program + argv 用。
+Script、CI、Router 未登録 CLI、または explicit remote exec 用の compatibility API です。通常の interactive workflow は `cf enter` を推奨します。
 
 ```powershell
 cf run -- git status
@@ -529,11 +631,13 @@ CloudFolder は managed block のみを：
 
 へ追加します。
 
+v0.7 では Agent / terminal を `cf enter` から起動し、その session では普通の Git / Python / build / test command を使うルールを優先します。`cf run` / `cf sh` は explicit remote exec / shell syntax 用です。
+
 Agent には：
 
 - normal local filesystem tool で edit
 - `cf here` で CloudFolder workspace を判定
-- Git/build/test/package manager/compiler/interpreter は `cf run`
+- `cf enter` 内では Git/build/test/package manager/compiler/interpreter を普通の command として実行
 - cold repository-wide scan は remote `rg` / `find` を優先
 - shell syntax は `cf sh`
 - この workspace のためだけに remote coding agent を追加起動しない
@@ -736,7 +840,11 @@ CloudFolder は現在 intentionally narrow です。
 - Beginner manager は現在主に **SFTP** を設定します。rclone の他 backend はまだ simple UI に全て公開していません。
 - **Live remote filesystem** であり、offline sync mirror ではありません。
 - network / server latency は残ります。
-- mount 上での Git、package manager、cold repository-wide scan は遅い場合があるため `cf run` 推奨です。
+- **`cf enter` 外**で mount 上の local Git、package manager、cold repository-wide scan を行うと遅い場合があります。terminal / Agent / `code .` は `cf enter` から起動することを推奨します。
+- Execution Router は明示的な remote-runtime tool shim list を使います。未登録 CLI は `cf run -- <tool>` で explicit remote exec できます。
+- Persistent Jobs は `setsid + nohup` ベースです。`cf job attach` は durable log attach であり、generic interactive stdin recovery ではありません。Slurm/PBS workload は scheduler 管理のままです。
+- `cf forward` は explicit forwarding で、任意 application stdout から port を自動検出する機能はまだありません。
+- `cf add <ssh-host>` の unattended SFTP service は copy 可能な key/certificate material が必要です。interactive password のみ、または user ssh-agent のみに存在する key は LocalSystem mount に直接変換できません。
 - POSIX permission / ownership は Windows semantics に常に完全 mapping できるわけではありません。
 - 現在の rclone SFTP projection は Linux symlink identity を native Windows symlink として完全保持しません。
 - Release は現在 **Authenticode code-sign 未対応**で、Windows SmartScreen が unknown publisher を表示する場合があります。ZIP と同時に SHA-256 checksum を公開します。
@@ -759,18 +867,19 @@ remote CloudFolder daemon は不要です。対象 directory にアクセスで�
 使うこと自体は可能ですが、Git の metadata-heavy access は cold network filesystem で遅くなる場合があります。
 
 ```powershell
-cf run -- git status
+cf enter
+git status
 ```
 
-を推奨します。
+を推奨します。script / legacy automation では `cf run -- git status` も利用できます。
 
-### 保存直後の file を `cf run` が見落としませんか？
+### `cf enter` 内の routed command が保存直後の file を見落としませんか？
 
-remote execution 前に VFS queued/in-progress writes が drain するまで待ちます。これが Workspace Consistency Contract の一部です。
+routed command は remote execution 前に VFS queued/in-progress writes が drain するまで待ちます。explicit `cf run` も同じ barrier を使います。これが Workspace Consistency Contract の一部です。
 
 ### Remote command が作った file が local で見えません
 
-`cf run` は execution 後に VFS view を refresh します。手動でも：
+routed command と `cf run` は execution 後に VFS view を refresh します。手動でも：
 
 ```powershell
 cf refresh
