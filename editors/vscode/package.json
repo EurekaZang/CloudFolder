@@ -2,7 +2,7 @@
   "name": "cloudfolder-remote-runtime",
   "displayName": "CloudFolder Remote Runtime",
   "description": "VS Code bridge for CloudFolder remote LSP, runtime sources, pytest, and Python debugging without VS Code Server.",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "publisher": "eurekazang",
   "license": "MIT",
   "repository": {

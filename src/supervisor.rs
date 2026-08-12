@@ -2,8 +2,9 @@ use crate::config::Config;
 use crate::logger::Logger;
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::size_of;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -573,6 +574,66 @@ pub fn run_change_feed(config_path: &Path) -> Result<()> {
 }
 
 fn targeted_forget(cfg: &Config, file: &str, dir: &str) -> Result<()> {
+    if let Err(http_error) = targeted_forget_http(cfg, file, dir) {
+        targeted_forget_cli(cfg, file, dir).with_context(|| {
+            format!("direct RC HTTP failed ({http_error}); rclone CLI fallback also failed")
+        })?;
+    }
+    Ok(())
+}
+
+fn targeted_forget_http(cfg: &Config, file: &str, dir: &str) -> Result<()> {
+    let address = cfg
+        .mount
+        .rc_addr
+        .to_socket_addrs()
+        .with_context(|| format!("resolving rclone RC address {}", cfg.mount.rc_addr))?
+        .next()
+        .with_context(|| {
+            format!(
+                "rclone RC address {} resolved to no sockets",
+                cfg.mount.rc_addr
+            )
+        })?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(750))
+        .with_context(|| format!("connecting to rclone RC at {}", cfg.mount.rc_addr))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    let mut params = serde_json::Map::new();
+    if !file.is_empty() {
+        params.insert("file".into(), serde_json::Value::String(file.into()));
+    }
+    if !dir.is_empty() {
+        params.insert("dir".into(), serde_json::Value::String(dir.into()));
+    }
+    let body = serde_json::to_vec(&serde_json::Value::Object(params))
+        .context("serializing targeted VFS invalidation")?;
+    write!(
+        stream,
+        "POST /vfs/forget HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        cfg.mount.rc_addr,
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status)?;
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
+        let mut response = String::new();
+        let _ = reader.read_to_string(&mut response);
+        bail!(
+            "rclone RC vfs/forget returned {}: {}",
+            status.trim(),
+            response.trim()
+        );
+    }
+    Ok(())
+}
+
+fn targeted_forget_cli(cfg: &Config, file: &str, dir: &str) -> Result<()> {
     let mut command = rc_command(cfg, "vfs/forget");
     if !file.is_empty() {
         command.arg(format!("file={file}"));
@@ -609,6 +670,7 @@ if fd<0: raise OSError(ctypes.get_errno(),'inotify_init1')
 MASK=0x00000002|0x00000004|0x00000008|0x00000040|0x00000080|0x00000100|0x00000200|0x00000400|0x00000800
 ISDIR=0x40000000
 OVERFLOW=0x00004000
+STRUCTURAL=0x00000040|0x00000080|0x00000100|0x00000200|0x00000400|0x00000800
 try:
     kernel_limit=int(open('/proc/sys/fs/inotify/max_user_watches').read().strip())
 except Exception:
@@ -659,7 +721,8 @@ for p in sorted(projects,key=len):
     add_tree(p,initial_limit)
 degraded=watch_failures>0 or len(path_to_wd)>=initial_limit or (scanned>len(path_to_wd) and not projects)
 print(json.dumps({{'ready_dirs':len(path_to_wd),'scanned_dirs':scanned,'project_roots':len(projects),'watch_limit':limit,'watch_failures':watch_failures,'degraded':degraded}}),flush=True)
-pending={{}}
+pending_files={{}}
+pending_dirs={{}}
 last=time.monotonic()
 while True:
     ready,_,_=select.select([fd],[],[],{debounce})
@@ -680,18 +743,25 @@ while True:
             rel=os.path.relpath(full,root)
             if rel.startswith('..'): continue
             parent=os.path.dirname(rel) or '.'
-            pending[(rel,parent)]=1
-            if new_dir: pending[('',rel)]=1
+            structural=bool(mask & STRUCTURAL or mask & ISDIR)
+            if structural:
+                pending_dirs[parent]=1
+            else:
+                pending_files[(rel,parent)]=1
+            if new_dir: pending_dirs[rel]=1
         last=time.monotonic()
-    elif pending and time.monotonic()-last>={debounce}:
-        if len(pending)<=512:
-            for rel,parent in pending:
-                print(json.dumps({{'file':rel.replace(os.sep,'/'),'dir':parent.replace(os.sep,'/')}}),flush=True)
+    elif (pending_files or pending_dirs) and time.monotonic()-last>={debounce}:
+        event_count=len(pending_files)+len(pending_dirs)
+        if event_count<=512:
+            for parent in sorted(pending_dirs):
+                print(json.dumps({{'file':'','dir':parent.replace(os.sep,'/'),'structural':True}}),flush=True)
+            for rel,parent in pending_files:
+                print(json.dumps({{'file':rel.replace(os.sep,'/'),'dir':'','content':True}}),flush=True)
         else:
-            dirs=sorted({{parent for rel,parent in pending}})
+            dirs=sorted(set(pending_dirs)|{{parent for rel,parent in pending_files}})
             for parent in dirs:
-                print(json.dumps({{'file':'','dir':parent.replace(os.sep,'/'),'bulk_events':len(pending)}}),flush=True)
-        pending.clear()
+                print(json.dumps({{'file':'','dir':parent.replace(os.sep,'/'),'bulk_events':event_count}}),flush=True)
+        pending_files.clear(); pending_dirs.clear()
 "#
     )
 }
@@ -926,6 +996,7 @@ fn backoff_with_jitter(base: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
 
     fn unique_test_dir(label: &str) -> PathBuf {
@@ -969,10 +1040,52 @@ cache_dir = 'C:\CloudFolderCacheTest'
             .expect("change-feed helper must have an event loop");
         assert!(event_loop.contains("select.select"));
         assert!(!event_loop.contains("os.walk("));
-        assert!(event_loop.contains("if len(pending)<=512"));
+        assert!(event_loop.contains("pending_files"));
+        assert!(event_loop.contains("pending_dirs"));
+        assert!(event_loop.contains("if event_count<=512"));
+        assert!(event_loop.contains("'structural':True"));
+        assert!(event_loop.contains("'content':True"));
         assert!(event_loop.contains("bulk_events"));
         assert!(script.contains("kernel_limit//4"));
         assert!(script.contains("watch_exhausted"));
+    }
+
+    #[test]
+    fn targeted_forget_prefers_direct_loopback_rc_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert_eq!(request_line.trim_end(), "POST /vfs/forget HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["file"], "repo/src/a.py");
+            assert_eq!(body["dir"], "repo/src");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n{}\n")
+                .unwrap();
+        });
+
+        let root = unique_test_dir("targeted-rc-http");
+        let mut cfg = cleanup_test_config(&root);
+        cfg.mount.rc_addr = address.to_string();
+        targeted_forget(&cfg, "repo/src/a.py", "repo/src").unwrap();
+        server.join().unwrap();
     }
 
     #[test]

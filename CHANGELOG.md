@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.1 - 2026-08-13
+
+Change-feed latency hardening after the v0.9.0 official-package gate.
+
+- Coalesce structural inotify events (`create/delete/move`) by parent directory before calling rclone RC, so a same-directory rename no longer performs separate `MOVED_FROM` and `MOVED_TO` VFS invalidations.
+- Keep content changes file-targeted instead of needlessly invalidating the parent directory on every modify/close-write event.
+- Send targeted invalidations directly from the Windows service to the loopback rclone RC HTTP endpoint, while retaining the existing `rclone.exe rc` path as a reliability fallback. This removes per-event CLI process-start overhead without changing failure behavior.
+- A post-restart 10-rename independent-SSH stress gate passed with substantial margin: 826ms P50, 855ms P95, and 879ms maximum. A separate create/content/modify/rename/delete gate measured 594/1081/339/708/854/836ms respectively.
+
 ## 0.9.0 - 2026-08-12
 
 CloudFolder v0.9 extends the v0.7 Local Workspace / Remote Runtime model into a workspace-wide runtime layer without removing the router, environment, jobs, forwarding, or SSH Config/ProxyJump workflows.
