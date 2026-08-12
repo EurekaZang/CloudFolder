@@ -97,6 +97,7 @@ CloudFolder therefore defines a **Workspace Consistency Contract**:
 4. **Strict SSH execution** — use the pinned key, `known_hosts`, and strict host verification.
 5. **Preserve exit status** — routed commands and explicit `cf run` return the remote program's exit code.
 6. **Refresh the view** — invalidate the VFS directory view after execution so remote-generated artifacts appear locally.
+7. **Remote Change Feed** — remote create/modify/rename/delete events that are unrelated to a foreground command trigger targeted VFS invalidation, extending consistency from command-bound to workspace-wide.
 
 > **The key CloudFolder feature is not “SFTP also mounts.” It is making the local filesystem plane and remote execution plane behave like one development workspace.**
 
@@ -164,6 +165,86 @@ runs in:
 ```
 
 No manual mental mapping between a Windows project path and a remote shell path.
+
+---
+
+# v0.9: Workspace-wide consistency, persistent transport, IDE + container runtime
+
+v0.7 established **Local Workspace / Remote Runtime**. v0.9 extends that abstraction beyond the lifetime of one routed command: independent remote writers, warm command execution, interactive terminals, IDE language/debug services, and Docker/Podman all share the same cwd, environment, consistency, and path-mapping model.
+
+## 1. Remote Change Feed — visibility is no longer tied to `cf run`
+
+Each mount service starts a rootless session-scoped Python/inotify helper over SSH. Nothing permanent is installed remotely and the helper does not poll the entire tree every second. Filesystem events are coalesced into targeted rclone VFS invalidations.
+
+Independent-SSH gate with **zero `cf run` / `cf refresh` calls**: create 1.379s, modify 1.413s, rename 1.716s, delete 0.863s. A timestamped background-job write reached the Windows view about 433ms after the remote write occurred.
+
+The helper reads the Linux inotify limit, uses a bounded fraction of it, reserves capacity for newly-created directories, prioritizes project roots, and coalesces >512 events by affected directory. During the 100k-file gate the connection/ready counters did not change, proving there was no periodic full-tree re-scan.
+
+> **Pathological boundary:** a single flat directory containing 100,000 files can still make the rclone/SFTP cold directory projection expensive; the measured lookup of the last cold entry was about 96.7s. That is giant-directory enumeration, not a watcher polling fallback. Normal project-directory independent changes passed the ≤2s gate.
+
+## 2. Persistent SSH Transport — stop paying authentication latency per command
+
+```powershell
+cf transport status
+cf transport bench GPU-Server 100
+cf transport restart
+```
+
+Every mount can keep a loopback-only CloudFolder Transport Broker and one long-lived SSH transport. Requests still execute in separate remote `/bin/sh` processes so cwd/environment cannot leak across commands; failures fall back to fresh SSH. PTY sessions and detached-job launch deliberately keep independent connection/lifecycle semantics rather than trading correctness for multiplexing.
+
+Real 1000-command gate: fresh SSH 502.9ms, warm P50 46.8ms, P95 50.1ms — about **10.7×** faster startup. Runtime upgrades stop only CloudFolder brokers before replacing `cf.exe`, then the next routed command lazily warms the transport again.
+
+## 3. PTY-aware Terminal Runtime — Python, GDB and top are actually interactive
+
+`cf enter` combines console state with command semantics. Bare Python/Node/GDB/top/less/shell commands receive a real PTY; pipelines, redirection, captured Agent commands, and automation stay non-PTY.
+
+```powershell
+cf run --pty -- python
+cf run --no-pty -- pytest -q
+```
+
+Live gates covered Python REPL, `Ctrl+C → KeyboardInterrupt`, Node REPL, GDB `break main → run → Breakpoint 1`, and full-screen `top`. With `--no-pty`, stdin/stdout/stderr all reported `isatty() == false`, and pipeline output remained byte-clean.
+
+## 4. Container-aware Runtime — map local cwd to the actual runtime, not merely the SSH host
+
+```toml
+[runtime]
+type = "docker"        # host / docker / podman
+container = "isaaclab"
+runtime_root = "/workspace"
+```
+
+The directory containing `.cloudfolder.toml` is the inferred host project root unless `host_root` is explicit. Routed commands, environments, PTYs, persistent jobs, forwarding, LSP/DAP/debugging, and test discovery all share:
+
+```text
+Windows cwd → remote host cwd → container runtime cwd
+```
+
+A real disposable gate proved that a module absent from the host but available only in the container (`VALUE=4242`) runs in `/workspace`; job metadata remains durable on the host, and `cf job stop` leaves no `CLOUDFOLDER_JOB_ID` orphan inside the container.
+
+Container forwarding does not depend on Docker bridge reachability. A session-scoped loopback runtime relay on the SSH host uses `docker/podman exec -i` to bridge bytes into the container. On a machine where host→Docker-bridge HTTP genuinely failed, `cf forward` through the relay still returned HTTP 200, and stop cleaned both tunnel and relay.
+
+## 5. Remote IDE Bridge — local editor UI, no VS Code Server
+
+```powershell
+cf lsp python
+cf lsp clangd
+cf lsp rust
+cf debug python -- main.py
+cf source read /usr/local/lib/python3.11/site-packages/pkg.py
+cf test discover --framework pytest
+```
+
+The core is an editor-agnostic Content-Length JSON bridge. Windows file URIs/paths are rewritten into the selected host/container runtime and diagnostics/definitions/DAP sources/stacks are rewritten back. Definitions outside the mounted workspace use the read-only `cloudfolder-runtime://<mount>/...` namespace instead of fake `C:\usr\...` paths, with `cf source read` serving the real source.
+
+Real gates:
+
+- **Pyright:** real diagnostics, `VALUE` completion, and Go to Definition into container-only site-packages via `cloudfolder-runtime://...`;
+- **debugpy:** verified breakpoint at local Windows `debug_target.py:4`, mapped stack frame, continue, and container-only dependency output `before 4242 / after 4243`;
+- **pytest:** container-only test discovered in 1.22s and run in 549ms with `1 passed`;
+- **clangd + CUDA:** clangd 19 consumed `/workspace/compile_commands.json`; the CUDA 13 header tree was byte-identical to the host copy, and `cudaError_t` resolved to the real `driver_types.h` through `cloudfolder-runtime://...`.
+
+[`editors/vscode`](editors/vscode) and the release asset `CloudFolder-vscode.vsix` provide a thin reference integration for LanguageClient, Testing, Python Debugger, and runtime-source documents. **No VS Code Server is installed remotely.**
 
 ---
 
@@ -560,13 +641,21 @@ cf here
 cf status [mount]
 cf enter [mount]
 cf env [use <profile>|reload]
+cf runtime [check]
+cf transport status|stop|restart|bench [mount]
+cf lsp [--mount <mount>] python|clangd|rust|-- <server> [args...]
+cf debug dap [--mount <mount>] -- <adapter> [args...]
+cf debug python [--mount <mount>] [--local-port <port>] -- <program> [args...]
+cf source read [--mount <mount>] <absolute-runtime-path>
+cf test discover [--mount <mount>] [--framework pytest]
+cf test run [--mount <mount>] <pytest-nodeid>
 cf job run|list|logs|attach|stop ...
 cf forward <remote-port> [local-port]
 cf forward list|stop ...
 cf add <ssh-config-host>
 cf flush [mount]
 cf refresh [mount]
-cf run [mount] -- <program> [args...]
+cf run [--pty|--no-pty] [mount] -- <program> [args...]
 cf sh [mount] -- <shell command>
 cf shell [mount]
 cf agent setup|status|remove
@@ -885,6 +974,9 @@ CloudFolder keeps its scope intentionally narrow today.
 - The beginner-friendly manager currently focuses on **SFTP**. rclone supports many more backends, but they are not all exposed in the simple UI.
 - CloudFolder is a **live remote filesystem**, not an offline synchronization mirror.
 - Network and server latency still exist.
+- v0.9 Remote Change Feed, the Transport Broker remote helper, and runtime relays require `python3` on remote Linux; the Change Feed also requires Linux inotify. The mount itself can still operate without those optional runtime capabilities, but the affected v0.9 feature fails/degrades explicitly and logs the reason rather than pretending realtime semantics.
+- inotify is a finite per-user resource. CloudFolder consumes a bounded budget and prioritizes project roots. If a mount contains far more directories than the available quota, `service-*.log` reports `degraded=true`; `cf refresh` remains available as an explicit recovery tool.
+- A single flat directory with about 100,000 files remains an rclone/SFTP cold-enumeration performance boundary. The real gate took about 96.7s to materialize the final cold entry; the Change Feed did not fall back to periodic full-tree polling.
 - Git, package managers, and cold repository-wide scans can still be slow if executed by a process that did not inherit the Execution Router. Start terminals, coding agents, and `code .` from `cf enter`; use explicit `cf run` / `cf sh` as the fallback for unlisted third-party CLIs and automation.
 - The Execution Router deliberately uses an explicit runtime-tool shim set rather than guessing every executable.
 - Persistent Jobs currently use `setsid + nohup`; `cf job attach` follows durable logs and does not restore arbitrary interactive stdin. Scheduler-managed HPC jobs should still use Slurm/PBS/etc.

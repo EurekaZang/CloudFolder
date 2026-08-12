@@ -1,0 +1,82 @@
+{
+  "name": "cloudfolder-remote-runtime",
+  "displayName": "CloudFolder Remote Runtime",
+  "description": "VS Code bridge for CloudFolder remote LSP, runtime sources, pytest, and Python debugging without VS Code Server.",
+  "version": "0.9.0",
+  "publisher": "eurekazang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EurekaZang/CloudFolder.git"
+  },
+  "homepage": "https://github.com/EurekaZang/CloudFolder",
+  "bugs": {
+    "url": "https://github.com/EurekaZang/CloudFolder/issues"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers",
+    "Testing"
+  ],
+  "keywords": [
+    "remote-development",
+    "ssh",
+    "lsp",
+    "debugpy",
+    "pytest",
+    "container"
+  ],
+  "activationEvents": [
+    "workspaceContains:.cloudfolder.toml",
+    "onCommand:cloudfolder.startPythonLsp",
+    "onCommand:cloudfolder.startClangdLsp",
+    "onCommand:cloudfolder.startRustAnalyzer",
+    "onCommand:cloudfolder.debugPython",
+    "onCommand:cloudfolder.refreshTests",
+    "onFileSystem:cloudfolder-runtime"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "bundle": "esbuild extension.js --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
+    "check": "node --check extension.js && npm run bundle -- --log-level=warning",
+    "vscode:prepublish": "npm run bundle",
+    "package": "npm run bundle && vsce package"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "cloudfolder.startPythonLsp",
+        "title": "CloudFolder: Start Remote Python LSP"
+      },
+      {
+        "command": "cloudfolder.startClangdLsp",
+        "title": "CloudFolder: Start Remote clangd"
+      },
+      {
+        "command": "cloudfolder.startRustAnalyzer",
+        "title": "CloudFolder: Start Remote rust-analyzer"
+      },
+      {
+        "command": "cloudfolder.debugPython",
+        "title": "CloudFolder: Debug Current Python File Remotely"
+      },
+      {
+        "command": "cloudfolder.refreshTests",
+        "title": "CloudFolder: Refresh Remote Pytest Tests"
+      }
+    ]
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "vscode-languageclient": "^9.0.1"
+  }
+}

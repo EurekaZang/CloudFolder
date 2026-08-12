@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.0 - 2026-08-12
+
+CloudFolder v0.9 extends the v0.7 Local Workspace / Remote Runtime model into a workspace-wide runtime layer without removing the router, environment, jobs, forwarding, or SSH Config/ProxyJump workflows.
+
+- Added a rootless, session-scoped Linux inotify Remote Change Feed with targeted VFS invalidation, bounded watch budgeting, project-root prioritization, dynamic directory watches, overflow handling, and burst coalescing. Independent remote create/modify/rename/delete passed the ≤2s real gate without `cf run` or `cf refresh`.
+- Added a loopback-only per-mount Transport Broker with one long-lived SSH transport, isolated remote shells per request, fresh-SSH fallback, and upgrade-safe cleanup. A 1000-command real gate measured 46.8ms warm P50 versus 502.9ms fresh SSH (~10.7x startup speedup).
+- Added PTY-aware routed execution plus `cf run --pty` / `--no-pty`; real Python/Node REPL, GDB breakpoint, full-screen top, and non-PTY pipeline gates passed.
+- Added `[runtime]` targets for host/Docker/Podman. Routed commands, environments, PTYs, jobs, forwarding, LSP/DAP/debugging, source access, and test discovery share the same host-root → runtime-root mapping.
+- Added a session-scoped host-loopback runtime relay for container forwarding/debugging so CloudFolder does not depend on Docker bridge reachability. Full-duplex streaming, HTTP forwarding, relay marker verification, and cleanup were validated live.
+- Added editor-agnostic LSP/DAP Content-Length bridging with Windows ↔ host/container path mapping, `cloudfolder-runtime://<mount>/...` external source documents, `cf source read`, `cf lsp`, generic `cf debug dap`, and `cf debug python`.
+- Added a debugpy listener-readiness handshake so `cf debug python` announces attach readiness only after the runtime DAP listener is actually open; fixed a stdout-lock deadlock found by the real breakpoint gate.
+- Added `cf test discover` / `cf test run` and a VS Code TestController for runtime-local pytest discovery/execution.
+- Added a thin VS Code reference extension for LanguageClient, runtime source documents, Python Debugger attach, and Testing. Release builds publish a directly-installable `CloudFolder-vscode.vsix`; no VS Code Server is installed remotely.
+- Real IDE gates passed with container-only dependencies: Pyright diagnostics/completion/external definition, debugpy verified breakpoint + mapped stack + continue, pytest discovery/run, and clangd 19 consuming remote `compile_commands.json` plus byte-identical real CUDA 13 headers.
+- Documented the pathological flat-directory boundary: a 100,000-file single directory can still be expensive for cold rclone/SFTP enumeration; the change feed itself did not reconnect, reinitialize, or fall back to periodic full-tree scanning during that gate.
+
 ## 0.7.0 - 2026-08-12
 
 Local Workspace / Remote Runtime release. This release lands the planned v0.5, v0.6, and v0.7 capability milestones together.

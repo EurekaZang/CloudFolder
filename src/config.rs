@@ -8,9 +8,46 @@ use std::time::Duration;
 pub struct Config {
     pub mount: MountConfig,
     #[serde(default)]
+    pub change_feed: ChangeFeedConfig,
+    #[serde(default)]
     pub health: HealthConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChangeFeedConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ssh_exe")]
+    pub ssh_exe: PathBuf,
+    #[serde(default)]
+    pub ssh_config: PathBuf,
+    #[serde(default)]
+    pub ssh_target: String,
+    #[serde(default)]
+    pub remote_root: String,
+    #[serde(default = "default_change_feed_debounce_ms")]
+    pub debounce_ms: u64,
+    #[serde(default = "default_change_feed_max_watches")]
+    pub max_watches: u64,
+    #[serde(default = "default_change_feed_reserve_watches")]
+    pub reserve_watches: u64,
+}
+
+impl Default for ChangeFeedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_exe: default_ssh_exe(),
+            ssh_config: PathBuf::new(),
+            ssh_target: String::new(),
+            remote_root: String::new(),
+            debounce_ms: default_change_feed_debounce_ms(),
+            max_watches: default_change_feed_max_watches(),
+            reserve_watches: default_change_feed_reserve_watches(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,6 +209,28 @@ impl Config {
         {
             bail!("mount.windows_file_security cannot contain line breaks");
         }
+        if self.change_feed.enabled {
+            if !self.change_feed.ssh_exe.is_absolute() {
+                bail!("change_feed.ssh_exe must be absolute when change feed is enabled");
+            }
+            if !self.change_feed.ssh_config.is_absolute() {
+                bail!("change_feed.ssh_config must be absolute when change feed is enabled");
+            }
+            if self.change_feed.ssh_target.trim().is_empty() {
+                bail!("change_feed.ssh_target is required when change feed is enabled");
+            }
+            if !self.change_feed.remote_root.starts_with('/') {
+                bail!("change_feed.remote_root must be an absolute Linux path");
+            }
+            if self.change_feed.debounce_ms < 25 || self.change_feed.debounce_ms > 5000 {
+                bail!("change_feed.debounce_ms must be between 25 and 5000");
+            }
+            if self.change_feed.max_watches < 1024
+                || self.change_feed.reserve_watches >= self.change_feed.max_watches
+            {
+                bail!("change_feed watch budget is invalid");
+            }
+        }
         Ok(())
     }
 
@@ -225,6 +284,18 @@ fn default_dir_perms() -> String {
 fn default_rc_addr() -> String {
     "127.0.0.1:5577".into()
 }
+fn default_ssh_exe() -> PathBuf {
+    PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe")
+}
+fn default_change_feed_debounce_ms() -> u64 {
+    150
+}
+fn default_change_feed_max_watches() -> u64 {
+    60_000
+}
+fn default_change_feed_reserve_watches() -> u64 {
+    4_096
+}
 fn default_probe_interval_secs() -> u64 {
     10
 }
@@ -272,6 +343,10 @@ mod tests {
         assert!(health.probe_timeout_secs < health.startup_timeout_secs);
         assert!(health.backoff_initial_secs <= health.backoff_max_secs);
         assert!(health.failure_threshold >= 1);
+        let feed = ChangeFeedConfig::default();
+        assert!(feed.debounce_ms > 0);
+        assert!(feed.reserve_watches < feed.max_watches);
+        assert!(feed.max_watches >= 1024);
     }
 
     #[test]

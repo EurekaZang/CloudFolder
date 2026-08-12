@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::logger::Logger;
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
@@ -71,7 +71,12 @@ impl Drop for KillOnCloseJob {
     }
 }
 
-pub fn run(cfg: Config, logger: Logger, stop: Arc<AtomicBool>) -> Result<()> {
+pub fn run(
+    cfg: Config,
+    config_path: Option<&Path>,
+    logger: Logger,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     verify_dependencies(&cfg)?;
     let child_job = KillOnCloseJob::new()?;
     fs::create_dir_all(&cfg.mount.cache_dir)
@@ -105,12 +110,31 @@ pub fn run(cfg: Config, logger: Logger, stop: Arc<AtomicBool>) -> Result<()> {
                 }
 
                 logger.info(&format!("mount ready pid={pid}"));
+                let mut change_feed = match config_path {
+                    Some(path) => match start_change_feed(&cfg, path, &child_job) {
+                        Ok(child) => child,
+                        Err(err) => {
+                            logger.warn(&format!("change feed did not start: {err:#}"));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 let stable_since = Instant::now();
-                let reason = supervise_running_mount(&cfg, &mut child, &stop, &logger)?;
+                let reason = supervise_running_mount(
+                    &cfg,
+                    config_path,
+                    &child_job,
+                    &mut child,
+                    &mut change_feed,
+                    &stop,
+                    &logger,
+                )?;
                 let stable_for = stable_since.elapsed().as_secs();
                 logger.warn(&format!(
                     "mount ended/recycled pid={pid}: {reason}; stable_for={stable_for}s"
                 ));
+                stop_change_feed(&mut change_feed, &logger);
                 stop_mount(&cfg, &mut child, &logger);
                 let _ = cleanup_stale_mount(&cfg, &logger);
 
@@ -320,7 +344,10 @@ fn wait_until_ready(
 
 fn supervise_running_mount(
     cfg: &Config,
+    config_path: Option<&Path>,
+    child_job: &KillOnCloseJob,
     child: &mut Child,
+    change_feed: &mut Option<Child>,
     stop: &Arc<AtomicBool>,
     logger: &Logger,
 ) -> Result<String> {
@@ -332,6 +359,31 @@ fn supervise_running_mount(
         }
         if let Some(status) = child.try_wait()? {
             return Ok(format!("rclone exited with {status}"));
+        }
+
+        if cfg.change_feed.enabled {
+            let should_restart = match change_feed.as_mut() {
+                Some(feed) => match feed.try_wait()? {
+                    Some(status) => {
+                        logger.warn(&format!("change feed exited with {status}; restarting"));
+                        true
+                    }
+                    None => false,
+                },
+                None => true,
+            };
+            if should_restart {
+                *change_feed = match config_path {
+                    Some(path) => match start_change_feed(cfg, path, child_job) {
+                        Ok(child) => child,
+                        Err(err) => {
+                            logger.warn(&format!("change feed restart failed: {err:#}"));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+            }
         }
 
         if Instant::now() >= next_probe {
@@ -361,6 +413,287 @@ fn supervise_running_mount(
         // potentially blocking filesystem probe at its own lower cadence.
         sleep_interruptible(1, stop);
     }
+}
+
+fn start_change_feed(
+    cfg: &Config,
+    config_path: &Path,
+    child_job: &KillOnCloseJob,
+) -> Result<Option<Child>> {
+    if !cfg.change_feed.enabled {
+        return Ok(None);
+    }
+    let exe = std::env::current_exe().context("locating CloudFolder service executable")?;
+    let mut child = Command::new(exe)
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("change-feed")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning change-feed worker")?;
+    if let Err(err) = child_job.assign(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    Ok(Some(child))
+}
+
+fn stop_change_feed(change_feed: &mut Option<Child>, logger: &Logger) {
+    let Some(mut child) = change_feed.take() else {
+        return;
+    };
+    if child.try_wait().ok().flatten().is_none() {
+        logger.info(&format!("stopping change feed pid={}", child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+pub fn run_change_feed(config_path: &Path) -> Result<()> {
+    let cfg = Config::load(config_path)?;
+    cfg.validate()?;
+    if !cfg.change_feed.enabled {
+        return Ok(());
+    }
+    if !cfg.change_feed.ssh_exe.is_file() {
+        bail!(
+            "change-feed ssh executable not found: {}",
+            cfg.change_feed.ssh_exe.display()
+        );
+    }
+    if !cfg.change_feed.ssh_config.is_file() {
+        bail!(
+            "change-feed SSH config not found: {}",
+            cfg.change_feed.ssh_config.display()
+        );
+    }
+    let logger = Logger::new(
+        &cfg.logging.service_log,
+        cfg.logging.max_bytes,
+        cfg.logging.keep_files,
+    )?;
+    let helper = remote_change_feed_script(
+        cfg.change_feed.debounce_ms,
+        cfg.change_feed.max_watches,
+        cfg.change_feed.reserve_watches,
+    );
+    let remote = format!(
+        "exec python3 -u -c {} {}",
+        posix_quote(&helper),
+        posix_quote(&cfg.change_feed.remote_root)
+    );
+    loop {
+        let mut ssh = Command::new(&cfg.change_feed.ssh_exe);
+        ssh.creation_flags(CREATE_NO_WINDOW)
+            .arg("-F")
+            .arg(&cfg.change_feed.ssh_config)
+            .args(["-o", "BatchMode=yes"])
+            .args(["-o", "ServerAliveInterval=15"])
+            .args(["-o", "ServerAliveCountMax=3"])
+            .arg(&cfg.change_feed.ssh_target)
+            .arg(&remote)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ssh
+            .spawn()
+            .context("starting remote change-feed SSH session")?;
+        logger.info(&format!(
+            "change feed connected target={} root={} pid={}",
+            cfg.change_feed.ssh_target,
+            cfg.change_feed.remote_root,
+            child.id()
+        ));
+        let stdout = child
+            .stdout
+            .take()
+            .context("change-feed stdout unavailable")?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        while reader.read_line(&mut line)? != 0 {
+            let text = line.trim_end_matches(['\r', '\n']);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(ready) = value.get("ready_dirs").and_then(|v| v.as_u64()) {
+                    let scanned = value
+                        .get("scanned_dirs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let projects = value
+                        .get("project_roots")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let failures = value
+                        .get("watch_failures")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let limit = value
+                        .get("watch_limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let degraded = value
+                        .get("degraded")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    logger.info(&format!(
+                        "change feed ready; watched_dirs={ready} scanned_dirs={scanned} project_roots={projects} watch_limit={limit} watch_failures={failures} degraded={degraded}"
+                    ));
+                } else if value.get("overflow").and_then(|v| v.as_bool()) == Some(true) {
+                    logger.warn(
+                        "change feed queue overflow; invalidating the full VFS directory cache",
+                    );
+                    let _ = rc_command(&cfg, "vfs/forget").status();
+                } else {
+                    let file = value.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                    let dir = value.get("dir").and_then(|v| v.as_str()).unwrap_or("");
+                    if (!file.is_empty() || !dir.is_empty())
+                        && targeted_forget(&cfg, file, dir).is_err()
+                    {
+                        logger.warn(&format!(
+                            "targeted VFS invalidation failed for file='{file}' dir='{dir}'"
+                        ));
+                    }
+                }
+            }
+            line.clear();
+        }
+        let status = child.wait().context("waiting for change-feed SSH")?;
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = err.read_to_string(&mut stderr);
+        }
+        logger.warn(&format!(
+            "change feed disconnected ({status}); {}",
+            stderr.trim()
+        ));
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn targeted_forget(cfg: &Config, file: &str, dir: &str) -> Result<()> {
+    let mut command = rc_command(cfg, "vfs/forget");
+    if !file.is_empty() {
+        command.arg(format!("file={file}"));
+    }
+    if !dir.is_empty() {
+        command.arg(format!("dir={dir}"));
+    }
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("running targeted vfs/forget")?;
+    if !output.status.success() {
+        bail!(
+            "vfs/forget failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn posix_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_change_feed_script(debounce_ms: u64, configured_max: u64, reserve: u64) -> String {
+    let debounce = (debounce_ms as f64 / 1000.0).clamp(0.025, 5.0);
+    format!(
+        r#"import ctypes,ctypes.util,json,os,select,struct,sys,time
+root=os.path.realpath(sys.argv[1])
+libc=ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6',use_errno=True)
+fd=libc.inotify_init1(0)
+if fd<0: raise OSError(ctypes.get_errno(),'inotify_init1')
+MASK=0x00000002|0x00000004|0x00000008|0x00000040|0x00000080|0x00000100|0x00000200|0x00000400|0x00000800
+ISDIR=0x40000000
+OVERFLOW=0x00004000
+try:
+    kernel_limit=int(open('/proc/sys/fs/inotify/max_user_watches').read().strip())
+except Exception:
+    kernel_limit={configured_max}
+limit=max(1024,min({configured_max},max(1024,kernel_limit//4)))
+reserve=min({reserve},max(0,limit//4))
+initial_limit=max(1,limit-reserve)
+wd_to_path={{}}
+path_to_wd={{}}
+watch_failures=0
+watch_exhausted=False
+def add_dir(p):
+    global watch_failures,watch_exhausted
+    p=os.path.realpath(p)
+    if p in path_to_wd: return True
+    if watch_exhausted or len(path_to_wd)>=limit: return False
+    wd=libc.inotify_add_watch(fd,os.fsencode(p),MASK)
+    if wd>=0:
+        old=wd_to_path.get(wd)
+        if old: path_to_wd.pop(old,None)
+        wd_to_path[wd]=p; path_to_wd[p]=wd; return True
+    watch_failures+=1
+    if ctypes.get_errno()==28: watch_exhausted=True
+    return False
+def add_tree(p,budget):
+    before=len(path_to_wd)
+    for base,dirs,files in os.walk(p,followlinks=False):
+        if watch_exhausted or len(path_to_wd)>=budget: break
+        add_dir(base)
+    return len(path_to_wd)-before
+PROJECT_MARKERS={{'.git','.cloudfolder.toml','pyproject.toml','Cargo.toml','package.json','go.mod'}}
+DISCOVERY_SKIP={{'.cache','.npm','.rustup','.local','.conda','node_modules','target','__pycache__','.venv','venv'}}
+DISCOVERY_DEPTH=5
+add_dir(root)
+projects=[]; scanned=0
+for base,dirs,files in os.walk(root,topdown=True,followlinks=False):
+    scanned+=1
+    rel=os.path.relpath(base,root); depth=0 if rel=='.' else rel.count(os.sep)+1
+    names=set(dirs)|set(files)
+    is_project=bool(PROJECT_MARKERS & names)
+    if depth<=2: add_dir(base)
+    if is_project:
+        projects.append(base); dirs[:]=[]; continue
+    dirs[:]=[d for d in dirs if d not in DISCOVERY_SKIP]
+    if depth>=DISCOVERY_DEPTH: dirs[:]=[]
+for p in sorted(projects,key=len):
+    if watch_exhausted or len(path_to_wd)>=initial_limit: break
+    add_tree(p,initial_limit)
+degraded=watch_failures>0 or len(path_to_wd)>=initial_limit or (scanned>len(path_to_wd) and not projects)
+print(json.dumps({{'ready_dirs':len(path_to_wd),'scanned_dirs':scanned,'project_roots':len(projects),'watch_limit':limit,'watch_failures':watch_failures,'degraded':degraded}}),flush=True)
+pending={{}}
+last=time.monotonic()
+while True:
+    ready,_,_=select.select([fd],[],[],{debounce})
+    if ready:
+        data=os.read(fd,1024*1024); off=0
+        while off+16<=len(data):
+            wd,mask,cookie,nlen=struct.unpack_from('iIII',data,off); off+=16
+            raw=data[off:off+nlen]; off+=nlen
+            name=os.fsdecode(raw.split(b'\0',1)[0]) if nlen else ''
+            base=wd_to_path.get(wd,root); full=os.path.join(base,name) if name else base
+            if mask & OVERFLOW:
+                print(json.dumps({{'overflow':True}}),flush=True); continue
+            new_dir=bool(mask & ISDIR and mask & (0x00000100|0x00000080) and os.path.isdir(full))
+            if new_dir: add_tree(full,limit)
+            if mask & (0x00000400|0x00000800):
+                old=wd_to_path.pop(wd,None)
+                if old: path_to_wd.pop(old,None)
+            rel=os.path.relpath(full,root)
+            if rel.startswith('..'): continue
+            parent=os.path.dirname(rel) or '.'
+            pending[(rel,parent)]=1
+            if new_dir: pending[('',rel)]=1
+        last=time.monotonic()
+    elif pending and time.monotonic()-last>={debounce}:
+        if len(pending)<=512:
+            for rel,parent in pending:
+                print(json.dumps({{'file':rel.replace(os.sep,'/'),'dir':parent.replace(os.sep,'/')}}),flush=True)
+        else:
+            dirs=sorted({{parent for rel,parent in pending}})
+            for parent in dirs:
+                print(json.dumps({{'file':'','dir':parent.replace(os.sep,'/'),'bulk_events':len(pending)}}),flush=True)
+        pending.clear()
+"#
+    )
 }
 
 fn probe_mount(mount_point: &Path, timeout: Duration) -> bool {
@@ -625,6 +958,21 @@ cache_dir = 'C:\CloudFolderCacheTest'
     fn jitter_is_bounded() {
         let value = backoff_with_jitter(10);
         assert!((10..=13).contains(&value));
+    }
+
+    #[test]
+    fn change_feed_event_loop_is_event_driven_and_bulk_coalesces() {
+        let script = remote_change_feed_script(150, 60_000, 4_096);
+        let event_loop = script
+            .split("while True:")
+            .nth(1)
+            .expect("change-feed helper must have an event loop");
+        assert!(event_loop.contains("select.select"));
+        assert!(!event_loop.contains("os.walk("));
+        assert!(event_loop.contains("if len(pending)<=512"));
+        assert!(event_loop.contains("bulk_events"));
+        assert!(script.contains("kernel_limit//4"));
+        assert!(script.contains("watch_exhausted"));
     }
 
     #[test]

@@ -52,6 +52,13 @@ fn main() -> Result<()> {
             let logger = Logger::new(&cfg.logging.service_log, cfg.logging.max_bytes, cfg.logging.keep_files)?;
             supervisor::cleanup_stale_mount(&cfg, &logger)
         }
+        Some("change-feed") => {
+            let config_path = args
+                .next()
+                .map(PathBuf::from)
+                .context("change-feed requires a service config path")?;
+            supervisor::run_change_feed(&config_path)
+        }
         Some("probe-path") => {
             let path = args
                 .next()
@@ -66,7 +73,7 @@ fn main() -> Result<()> {
         }
         None => start_service_dispatcher(SERVICE_NAME.to_string(), default_config_path()),
         Some(other) => anyhow::bail!(
-            "unknown command '{other}'. Use: service [service-name] [config] | console [config] | check [config] | check-remote [config] | cleanup [config] | probe-path <path>"
+            "unknown command '{other}'. Use: service [service-name] [config] | console [config] | check [config] | check-remote [config] | cleanup [config] | change-feed <config> | probe-path <path>"
         ),
     }
 }
@@ -98,7 +105,7 @@ fn run_console(config_path: &Path) -> Result<()> {
     )?;
     logger.info("starting in console mode");
     let stop = Arc::new(AtomicBool::new(false));
-    supervisor::run(cfg, logger, stop)
+    supervisor::run(cfg, Some(config_path), logger, stop)
 }
 
 fn service_main(_arguments: Vec<OsString>) {
@@ -167,7 +174,7 @@ fn run_service() -> Result<()> {
         runtime.name,
         config_path.display()
     ));
-    let result = supervisor::run(cfg, logger.clone(), stop);
+    let result = supervisor::run(cfg, Some(&config_path), logger.clone(), stop);
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,

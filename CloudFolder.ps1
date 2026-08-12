@@ -355,6 +355,7 @@ function Upgrade-ExistingMounts {
                     $record | Add-Member -NotePropertyName remote_root -NotePropertyValue $remoteRoot
                 }
             }
+            Ensure-ExistingChangeFeedConfig $record $mountDir $configPath
             $metadataJson = $record | ConvertTo-Json -Depth 6
             [IO.File]::WriteAllText($metadataPath, $metadataJson, $utf8NoBom)
         } catch {
@@ -414,12 +415,31 @@ function Ensure-Rclone {
     }
 }
 
+function Stop-CloudFolderTransportBrokers {
+    $installedCfPath = Join-Path $InstallDir 'cf.exe'
+    Get-CimInstance Win32_Process -Filter "Name='cf.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+        $exe = [string]$_.ExecutablePath
+        $commandLine = [string]$_.CommandLine
+        if (-not [string]::IsNullOrWhiteSpace($exe) -and
+            $exe.Equals($installedCfPath, [StringComparison]::OrdinalIgnoreCase) -and
+            $commandLine -match '(?i)\btransport\s+serve\b') {
+            & taskkill.exe /PID ([string]$_.ProcessId) /T /F | Out-Null
+        }
+    }
+    if (Test-Path -LiteralPath $MountsDir) {
+        Get-ChildItem -LiteralPath $MountsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -LiteralPath (Join-Path $_.FullName 'transport.json') -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Install-Runtime {
     Ensure-Admin
     Ensure-OpenSshClient
 
     $payloadExe = Get-PayloadExe
     $payloadCfExe = Get-PayloadCfExe
+    Stop-CloudFolderTransportBrokers
     $runningBefore = @()
     Get-Service -Name 'CloudFolder.*' -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.Status -eq 'Running') { $runningBefore += $_.Name }
@@ -820,6 +840,111 @@ function New-ServiceSshSnapshot([string]$MountDir, [object[]]$ResolvedHosts) {
     return $serviceConfigPath
 }
 
+function New-DirectServiceSshResolved(
+    [string]$Alias,
+    [string]$TargetHost,
+    [int]$TargetPort,
+    [string]$TargetUser,
+    [string]$PrivateKey,
+    [string]$KnownHosts,
+    [string]$HostKeyAlgorithm
+) {
+    $lines = @(
+        "host $Alias",
+        "hostname $TargetHost",
+        "user $TargetUser",
+        "port $TargetPort",
+        "identityfile $PrivateKey",
+        "userknownhostsfile $KnownHosts",
+        'identitiesonly yes',
+        'stricthostkeychecking yes',
+        'batchmode yes'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($HostKeyAlgorithm)) {
+        $lines += "hostkeyalgorithms $HostKeyAlgorithm"
+    }
+    return [pscustomobject]@{
+        Alias = $Alias
+        HostName = $TargetHost
+        User = $TargetUser
+        Port = $TargetPort
+        Lines = @($lines)
+    }
+}
+
+function Ensure-ExistingChangeFeedConfig([object]$Record, [string]$MountDir, [string]$ConfigPath) {
+    $remoteRoot = [string]$Record.remote_root
+    if ([string]::IsNullOrWhiteSpace($remoteRoot) -or -not $remoteRoot.StartsWith('/')) {
+        Write-Warning "Skipping change-feed migration for '$($Record.name)': remote_root is unavailable."
+        return
+    }
+
+    $serviceSshConfigPath = if ($Record.PSObject.Properties['service_ssh_config']) { [string]$Record.service_ssh_config } else { '' }
+    $sshAlias = if ($Record.PSObject.Properties['ssh_alias']) { [string]$Record.ssh_alias } else { '' }
+    $serviceSshTarget = if ($Record.PSObject.Properties['service_ssh_target']) { [string]$Record.service_ssh_target } else { '' }
+    if ([string]::IsNullOrWhiteSpace($serviceSshTarget)) {
+        $serviceSshTarget = if ([string]::IsNullOrWhiteSpace($sshAlias)) { 'cloudfolder-service' } else { $sshAlias }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($serviceSshConfigPath) -or -not (Test-Path -LiteralPath $serviceSshConfigPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($sshAlias)) {
+            $userConfig = if ($Record.PSObject.Properties['ssh_config']) { [string]$Record.ssh_config } else { '' }
+            if ([string]::IsNullOrWhiteSpace($userConfig) -or -not (Test-Path -LiteralPath $userConfig)) {
+                Write-Warning "Skipping change-feed migration for '$($Record.name)': SSH config is unavailable."
+                return
+            }
+            $rootResolved = Get-SshResolvedConfig $sshAlias $userConfig
+            $resolvedHosts = @($rootResolved)
+            $seenJumpHosts = New-Object System.Collections.Generic.HashSet[string]([StringComparer]::OrdinalIgnoreCase)
+            $jumpQueue = New-Object System.Collections.Generic.Queue[string]
+            foreach ($jumpHost in @(Get-ProxyJumpAliases $rootResolved.Lines)) { $jumpQueue.Enqueue($jumpHost) }
+            while ($jumpQueue.Count -gt 0) {
+                $jumpHost = $jumpQueue.Dequeue()
+                if (-not $seenJumpHosts.Add($jumpHost)) { continue }
+                $jumpResolved = Get-SshResolvedConfig $jumpHost $userConfig
+                $resolvedHosts += $jumpResolved
+                foreach ($nestedJump in @(Get-ProxyJumpAliases $jumpResolved.Lines)) { $jumpQueue.Enqueue($nestedJump) }
+            }
+            $serviceSshConfigPath = New-ServiceSshSnapshot $MountDir $resolvedHosts
+        } else {
+            $keyFile = if ($Record.PSObject.Properties['key_file']) { [string]$Record.key_file } else { '' }
+            $knownHosts = if ($Record.PSObject.Properties['known_hosts']) { [string]$Record.known_hosts } else { '' }
+            if (-not (Test-Path -LiteralPath $keyFile) -or -not (Test-Path -LiteralPath $knownHosts)) {
+                Write-Warning "Skipping change-feed migration for '$($Record.name)': direct SSH material is unavailable."
+                return
+            }
+            $algorithm = if ($Record.PSObject.Properties['host_key_algorithm']) { [string]$Record.host_key_algorithm } else { '' }
+            $resolved = New-DirectServiceSshResolved $serviceSshTarget ([string]$Record.host) ([int]$Record.port) ([string]$Record.user) $keyFile $knownHosts $algorithm
+            $serviceSshConfigPath = New-ServiceSshSnapshot $MountDir @($resolved)
+        }
+    } else {
+        Protect-ServiceSshSnapshot $serviceSshConfigPath
+    }
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) { return }
+    $configText = Get-Content -LiteralPath $ConfigPath -Raw
+    if ($configText -notmatch '(?m)^\[change_feed\]\s*$') {
+        $section = @"
+[change_feed]
+enabled = true
+ssh_exe = "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+ssh_config = "$(ConvertTo-TomlString $serviceSshConfigPath)"
+ssh_target = "$(ConvertTo-TomlString $serviceSshTarget)"
+remote_root = "$(ConvertTo-TomlString $remoteRoot)"
+debounce_ms = 150
+max_watches = 60000
+reserve_watches = 4096
+"@
+        $configText = $configText.TrimEnd() + "`r`n`r`n" + $section.Trim() + "`r`n"
+        [IO.File]::WriteAllText($ConfigPath, $configText, (New-Object Text.UTF8Encoding($false)))
+        Write-Host "Enabled remote change feed for $($Record.name)." -ForegroundColor DarkGray
+    }
+    if ($Record.PSObject.Properties['service_ssh_config']) { $Record.service_ssh_config = $serviceSshConfigPath }
+    else { $Record | Add-Member -NotePropertyName service_ssh_config -NotePropertyValue $serviceSshConfigPath }
+    if ($Record.PSObject.Properties['service_ssh_target']) { $Record.service_ssh_target = $serviceSshTarget }
+    else { $Record | Add-Member -NotePropertyName service_ssh_target -NotePropertyValue $serviceSshTarget }
+}
+
 function Protect-ServiceSshSnapshot([string]$ServiceConfigPath) {
     if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { return }
     $sshDir = Split-Path -Parent $ServiceConfigPath
@@ -979,6 +1104,7 @@ function Add-Mount {
     $hostKeyAlgorithm = ''
     $serviceSshResolved = @()
     $serviceSshConfigPath = ''
+    $serviceSshTarget = if ($usingSshConfig) { $SshHost } else { 'cloudfolder-service' }
     if ($usingSshConfig) {
         if (-not (Test-SshAliasLogin $SshHost $sshConfigPath)) {
             throw "Formal Gate failed: 'ssh $SshHost' must work non-interactively before 'cf add $SshHost' can adopt it."
@@ -1015,6 +1141,9 @@ function Add-Mount {
         $hostKeyAlgorithm = Get-NegotiatedHostKeyAlgorithm $targetHost $targetPort $targetUser $privateKey $knownHosts
         Grant-ServiceKeyAccess $privateKey $knownHosts
         $remoteRoot = Resolve-RemoteRoot $targetHost $targetPort $targetUser $privateKey $knownHosts $targetRemotePath
+        $serviceSshResolved = @(
+            New-DirectServiceSshResolved $serviceSshTarget $targetHost $targetPort $targetUser $privateKey $knownHosts $hostKeyAlgorithm
+        )
     }
     $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsUserSid = $windowsIdentity.User.Value
@@ -1055,8 +1184,8 @@ function Add-Mount {
             New-Item -ItemType Directory -Force -Path $mountParent | Out-Null
         }
 
+        $serviceSshConfigPath = New-ServiceSshSnapshot $mountDir $serviceSshResolved
         if ($usingSshConfig) {
-            $serviceSshConfigPath = New-ServiceSshSnapshot $mountDir $serviceSshResolved
             $externalSsh = Get-RcloneExternalSshCommand $SshHost $serviceSshConfigPath
             $rcloneConfig = @"
 [remote]
@@ -1108,6 +1237,16 @@ windows_file_security = "$(ConvertTo-TomlString $windowsFileSecurity)"
 read_only = $($ReadOnly.IsPresent.ToString().ToLowerInvariant())
 rc_addr = "127.0.0.1:$rcPort"
 
+[change_feed]
+enabled = true
+ssh_exe = "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+ssh_config = "$(ConvertTo-TomlString $serviceSshConfigPath)"
+ssh_target = "$(ConvertTo-TomlString $serviceSshTarget)"
+remote_root = "$(ConvertTo-TomlString $remoteRoot)"
+debounce_ms = 150
+max_watches = 60000
+reserve_watches = 4096
+
 [health]
 probe_interval_secs = 10
 probe_timeout_secs = 5
@@ -1143,7 +1282,8 @@ keep_files = 5
         known_hosts = $knownHosts
         ssh_alias = if ($usingSshConfig) { $SshHost } else { '' }
         ssh_config = if ($usingSshConfig) { $sshConfigPath } else { '' }
-        service_ssh_config = if ($usingSshConfig) { $serviceSshConfigPath } else { '' }
+        service_ssh_config = $serviceSshConfigPath
+        service_ssh_target = $serviceSshTarget
         host_key_algorithm = $hostKeyAlgorithm
         windows_user_sid = $windowsUserSid
         cache_dir = $cacheDir

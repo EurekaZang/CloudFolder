@@ -22,6 +22,16 @@ windows_file_security = ""
 read_only = false
 rc_addr = "127.0.0.1:55770"
 
+[change_feed]
+enabled = true
+ssh_exe = "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+ssh_config = "C:\\ProgramData\\CloudFolder\\mounts\\example\\ssh-service\\config"
+ssh_target = "cloudfolder-service"
+remote_root = "/home/alice"
+debounce_ms = 150
+max_watches = 60000
+reserve_watches = 4096
+
 [health]
 probe_interval_secs = 10
 probe_timeout_secs = 5

@@ -97,6 +97,7 @@ CloudFolder 为此提供一个 **Workspace Consistency Contract（工作区一�
 4. **Strict SSH Execution**：使用固定 key、`known_hosts` 和严格 host verification 执行；
 5. **Exit Code Preservation**：routed command 与显式 `cf run` 都保留远端程序 exit code；
 6. **View Refresh**：执行完成后刷新 VFS 目录视图，让远端生成的 artifacts 回到本地可见状态。
+7. **Remote Change Feed**：与前台 command 无关的 remote create/modify/rename/delete 也会触发 targeted VFS invalidation，让一致性从 command-bound 扩展到 workspace-wide。
 
 因此：
 
@@ -174,6 +175,86 @@ pwd
 中执行。
 
 **你不再需要在“本地文件路径”和“远端 shell 路径”之间自己做 mental mapping。**
+
+---
+
+# v0.9：Workspace-wide Consistency / Persistent Transport / IDE + Container Runtime
+
+v0.7 建立了 **Local Workspace / Remote Runtime**。v0.9 把这个抽象从“command-bound”推进到整个 workspace：远端自己写文件、本地连续执行命令、交互式 terminal、IDE language service/debugger，以及 Docker/Podman runtime 都使用同一套 cwd、environment、consistency 和 path mapping。
+
+## 1. Remote Change Feed —— 不再靠 `cf run` 才刷新
+
+每个 mount service 会通过一条 session-scoped SSH connection 在 Linux 端启动无 root 的 Python/inotify helper。它不会安装永久 daemon，也不会每秒扫描整棵目录树；文件事件会被合并为 targeted rclone VFS invalidation。
+
+真实独立 SSH Gate（**0 次 `cf run` / `cf refresh`**）：create 1.379s、modify 1.413s、rename 1.716s、delete 0.863s；后台 job 的一次真实写入从 remote timestamp 到 Windows 可见约 433ms。
+
+watcher 会读取 Linux inotify limit，只使用受控预算、为动态目录保留容量，并优先发现 project root；>512 个 burst event 会按受影响目录合并。10 万文件 Gate 中 change-feed connection/ready count 保持不变，证明没有周期性 full-tree re-scan。
+
+> **极端边界：**单个目录直接包含 100,000 个文件时，rclone/SFTP 的首次目录枚举仍可能很慢；实机读取最后一个 cold entry 约 96.7s。这个边界来自巨型单目录 projection，而不是 watcher 回退到轮询扫描。正常 project directory 的独立 remote change Gate 仍为 ≤2s。
+
+## 2. Persistent SSH Transport —— routed command 不再每次重新认证
+
+```powershell
+cf transport status
+cf transport bench GPU-Server 100
+cf transport restart
+```
+
+CloudFolder 为每个 mount 维护 loopback-only Transport Broker 和一条长寿命 SSH transport。每个 request 仍在远端独立 `/bin/sh` 中执行，避免 cwd/environment 污染；broker 不可用时自动回退 fresh SSH。PTY、detached job launch 等需要独立 terminal/lifecycle semantics 的路径不会为了复用连接而牺牲正确性。
+
+真实 6000 端 1000-command Gate：fresh SSH 502.9ms，warm P50 46.8ms，P95 50.1ms，约 **10.7×** startup speedup。安装升级会先只关闭 CloudFolder 自己的 broker，避免 `cf.exe` 自锁；下一条 routed command 自动 lazy restart。
+
+## 3. PTY-aware Terminal Runtime —— Python / GDB / top 真正可交互
+
+`cf enter` 会根据 stdin/stdout terminal state 与命令语义自动决定 PTY。裸 `python` / `node` / `gdb` / `top` / `less` / interactive shell 获得真实 TTY；pipeline、Agent automation 与重定向保持无 PTY。
+
+```powershell
+cf run --pty -- python
+cf run --no-pty -- pytest -q
+```
+
+实机 Gate 已验证 Python REPL、`Ctrl+C → KeyboardInterrupt`、Node REPL、GDB `break main → run → Breakpoint 1`、全屏 `top`；`--no-pty` 下 stdin/stdout/stderr `isatty()` 全部为 false，pipeline 输出不被 ANSI/CRLF 语义污染。
+
+## 4. Container-aware Runtime —— local cwd 映射到真正 runtime，而不只 SSH host
+
+```toml
+[runtime]
+type = "docker"        # host / docker / podman
+container = "isaaclab"
+runtime_root = "/workspace"
+```
+
+`.cloudfolder.toml` 所在目录默认就是 host project root，也可显式配置 `host_root`。routed command、environment、PTY、persistent job、forward、LSP/DAP/debugger/test discovery 全部共享同一套：
+
+```text
+Windows cwd → remote host cwd → container runtime cwd
+```
+
+真实 Gate 中 host 无 `cf_runtime_only`，container-only module 的 `VALUE=4242` 被 routed Python 正确读取，cwd 为 `/workspace`；container job 的 durable metadata 留在 host，`cf job stop` 后 container 内没有 `CLOUDFOLDER_JOB_ID` orphan。
+
+Container forwarding 不依赖 Docker bridge IP：CloudFolder 会在 remote host loopback 启动 session-scoped runtime relay，再通过 `docker/podman exec -i` 桥到 container loopback。即使实测 host→Docker bridge HTTP 不可用，本地 `cf forward` 仍返回 HTTP 200；stop 时 SSH tunnel 与 relay 一起清理。
+
+## 5. Remote IDE Bridge —— local IDE UI，不安装 VS Code Server
+
+```powershell
+cf lsp python
+cf lsp clangd
+cf lsp rust
+cf debug python -- main.py
+cf source read /usr/local/lib/python3.11/site-packages/pkg.py
+cf test discover --framework pytest
+```
+
+底层是 editor-agnostic Content-Length JSON bridge：Windows `file://` / path 会映射到 remote host/container，diagnostics、definition、DAP source/stack 再映回 Windows。workspace 外部源码不会伪造 `C:\usr\...`，而是使用只读 `cloudfolder-runtime://<mount>/...`；`cf source read` 从真实 runtime 读取内容。
+
+真实 Formal Gates：
+
+- **Pyright：**container-only module 产生真实 diagnostics，completion 包含 `VALUE`，Go to Definition 跳到 `cloudfolder-runtime://.../site-packages/cf_runtime_only.py`；
+- **debugpy：**breakpoint verified，真实停在 Windows `debug_target.py:4`，stack path 映回 Windows，continue 后 container-only dependency 输出 `before 4242 / after 4243`；
+- **pytest：**`cf test discover` 1.22s 发现 container-only test，`cf test run` 549ms 完成 `1 passed`；
+- **clangd + CUDA：**clangd 19 使用 remote `/workspace/compile_commands.json`，真实 CUDA 13 header 与 host SHA256 完全一致；`cudaError_t` definition 跳到真实 `driver_types.h` 并映射为 `cloudfolder-runtime://...`。
+
+仓库与 Release 同时提供 [`editors/vscode`](editors/vscode) reference extension / `CloudFolder-vscode.vsix`：它只负责把 VS Code LanguageClient、Testing、Python Debugger 和 `cloudfolder-runtime://` provider 接到上述 `cf` API，**远端不安装 VS Code Server**。
 
 ---
 
@@ -598,6 +679,14 @@ cf here
 cf status [mount]
 cf enter [mount]
 cf env [use <profile>|reload]
+cf runtime [check]
+cf transport status|stop|restart|bench [mount]
+cf lsp [--mount <mount>] python|clangd|rust|-- <server> [args...]
+cf debug dap [--mount <mount>] -- <adapter> [args...]
+cf debug python [--mount <mount>] [--local-port <port>] -- <program> [args...]
+cf source read [--mount <mount>] <absolute-runtime-path>
+cf test discover [--mount <mount>] [--framework pytest]
+cf test run [--mount <mount>] <pytest-nodeid>
 cf job run [mount] -- <program> [args...]
 cf job list [mount]
 cf job logs [-f] <job> [--mount <mount>]
@@ -609,7 +698,7 @@ cf forward stop <local-port|all> [--mount <mount>]
 cf add <ssh-config-host>
 cf flush [mount]
 cf refresh [mount]
-cf run [mount] -- <program> [args...]
+cf run [--pty|--no-pty] [mount] -- <program> [args...]
 cf sh [mount] -- <shell command>
 cf shell [mount]
 cf agent setup|status|remove
@@ -783,14 +872,14 @@ CloudFolder 会维护：
 
 中的 CloudFolder managed block。
 
-v0.7 的 managed block 会优先建议从 `cf enter` 启动 Agent/terminal；在该 session 中直接使用普通 Git / Python / build / test 命令。`cf run` / `cf sh` 仍用于显式 remote exec 与 shell syntax。
+v0.9 的 managed block 会优先建议从 `cf enter` 启动 Agent/terminal；在该 session 中直接使用普通 Git / Python / build / test 命令。`cf run` / `cf sh` 只保留给显式 remote exec、Router 未覆盖的 CLI 与 shell syntax。
 
 这段规则会告诉 Agent：
 
 - 普通文件读写直接使用本地路径；
 - `cf here` 判断是否处于 CloudFolder workspace；
-- Git/build/test/package manager/compiler/interpreter 使用 `cf run`；
-- repository-wide scan 优先 `cf run -- rg ...` / `find`；
+- `cf enter` 内 Git/build/test/package manager/compiler/interpreter 直接使用普通命令；
+- repository-wide scan 优先 routed `rg` / `find`；
 - pipeline / redirect 使用 `cf sh`；
 - 不要为了这个 workspace 再在远端启动第二个 coding agent。
 
@@ -816,25 +905,32 @@ flowchart LR
     S[SFTP]
     L[Remote Linux Files]
     C[cf.exe]
+    B[Persistent Transport Broker]
+    RT[Host / Docker / Podman Runtime]
+    CF[Remote Change Feed]
+    IDE[LSP / DAP / Test Bridge]
     SSH[Windows OpenSSH]
     T[Remote Linux Toolchain]
     SV[CloudFolderService.exe]
 
     A -->|normal file I/O| P
     P --> W --> R --> S --> L
-    A -->|Git / test / build| C
-    C -->|flush + cwd mapping| SSH --> T
+    A -->|Git / test / build / IDE| C
+    C --> B --> SSH --> RT --> T
+    C --> IDE --> RT
     SV -. supervise / health / recover .-> R
-    C -. refresh VFS .-> R
+    CF -. targeted invalidation .-> R
+    SV -. session helper .-> CF
 ```
 
 换成一句话：
 
 ```text
 Data plane:       Windows path → WinFsp → rclone VFS → SFTP → remote files
-Execution plane:  local cwd → cf.exe → SSH → matching Linux cwd
-Control plane:    CloudFolderService → health / restart / backoff / cleanup
-Agent plane:      Claude/Codex instructions → choose local I/O or remote execution
+Execution plane:  local cwd → cf.exe → warm/fresh SSH → host/container runtime cwd
+IDE plane:        VS Code/editor → cf LSP/DAP/test bridge → same remote runtime
+Control plane:    CloudFolderService → health / restart / change feed / cleanup
+Agent plane:      Claude/Codex instructions → local file I/O + transparent remote runtime
 ```
 
 ---
@@ -1056,6 +1152,9 @@ CloudFolder 目前主动保持 scope 很窄。
 - 一键 Manager 当前主要配置 **SFTP**；rclone 支持更多 backend，但还没有全部暴露进小白 UI；
 - CloudFolder 是 **live remote filesystem**，不是离线同步盘；
 - 网络延迟和服务器性能仍然存在；
+- v0.9 Remote Change Feed / Transport Broker / runtime relay 依赖 remote Linux 的 `python3`；Change Feed 还依赖 Linux inotify。缺少这些能力时 mount 本身仍可工作，但对应 v0.9 runtime feature 会明确失败/降级并写日志，而不会静默宣称 realtime；
+- inotify 是 per-user 有限资源。CloudFolder 只使用受控预算并优先 project root；如果 mount 覆盖的目录数量远超可用 watch quota，`service-*.log` 会明确记录 `degraded=true`，用户仍可用 `cf refresh` 做 recovery；
+- 单个目录直接包含约 100,000 个文件时，rclone/SFTP cold enumeration 可能非常慢。实机 Gate 的最后一个 cold entry 首次可见约 96.7s；这不代表 Change Feed 回退成 full-tree polling；
 - 在 **`cf enter` 之外**直接对 mount 执行本地 Git、package manager 或 cold repository-wide scan 仍可能很慢；优先从 `cf enter` 启动 terminal / Agent / `code .`；
 - Execution Router 当前使用明确的 remote-runtime tool shim 列表，不会猜测任意 EXE；未列入 Router 的 CLI 可显式使用 `cf run -- <tool>`；
 - Persistent Jobs 当前基于 `setsid + nohup`；`cf job attach` 是 durable log attach，不是任意交互式 stdin 恢复；Slurm/PBS 等 scheduler workload 仍由 scheduler 管理；

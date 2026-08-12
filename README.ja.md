@@ -97,6 +97,7 @@ CloudFolder はそのために **Workspace Consistency Contract** を提供し�
 4. **Strict SSH execution** — 専用 key、`known_hosts`、strict host verification を使う。
 5. **Exit code preservation** — routed command と explicit `cf run` の両方で remote program の exit code を保持する。
 6. **View refresh** — 実行後に VFS view を更新して、remote artifact を local から見えるようにする。
+7. **Remote Change Feed** — foreground command と無関係な remote create/modify/rename/delete も targeted VFS invalidation を起こし、consistency を command-bound から workspace-wide へ拡張する。
 
 > **CloudFolder のコアは「SFTP を mount できること」ではなく、local filesystem plane と remote execution plane を 1 つの development workspace にすることです。**
 
@@ -171,6 +172,55 @@ pwd
 で実行されます。
 
 **Windows path と remote shell path の mental mapping を自分で維持する必要がありません。**
+
+---
+
+# v0.9：Workspace-wide Consistency / Persistent Transport / IDE + Container Runtime
+
+v0.7 の **Local Workspace / Remote Runtime** を、v0.9 では command の lifetime を超えて workspace 全体へ拡張しました。独立 remote writer、warm command、interactive terminal、IDE language/debug service、Docker/Podman が同じ cwd / environment / consistency / path mapping を使います。
+
+## 1. Remote Change Feed
+
+各 mount service は SSH 経由で root 不要・session-scoped の Python/inotify helper を起動します。remote に永久 daemon を install せず、毎秒 full-tree scan もしません。event は targeted rclone VFS invalidation に coalesce されます。
+
+独立 SSH Gate（`cf run` / `cf refresh` **0 回**）：create 1.379s、modify 1.413s、rename 1.716s、delete 0.863s。background job の timestamped write は remote write から Windows visible まで約 433ms でした。
+
+inotify limit を読み、budget / reserve / project priority / >512 event の directory coalescing を使います。100k-file Gate でも watcher connection/ready count は変化せず、periodic full-tree re-scan はありませんでした。
+
+> **極端な境界：**単一 directory に 100,000 file を直接置く layout は rclone/SFTP cold enumeration 自体が高コストで、last cold entry lookup は約 96.7s でした。これは watcher polling fallback ではありません。通常 project directory の independent remote change は ≤2s Gate を通過しています。
+
+## 2. Persistent SSH Transport
+
+mount ごとに loopback-only Transport Broker + long-lived SSH transport を保持できます。各 request は独立 remote `/bin/sh` で実行され、cwd/environment contamination はありません。PTY と detached job launch は correctness のため独立 lifecycle を維持します。
+
+1000 command の実測：fresh SSH 502.9ms、warm P50 46.8ms / P95 50.1ms、startup は約 **10.7×** 高速化しました。upgrade 時は CloudFolder broker だけを止め、次の command で lazy warm-up します。
+
+## 3. PTY-aware Terminal Runtime
+
+`cf enter` は console state + command semantics から PTY を自動判断します。bare Python / Node / GDB / top / less / shell は real PTY、pipeline / redirect / Agent automation は non-PTY です。`cf run --pty` / `--no-pty` で明示 override もできます。
+
+実機で Python REPL、Ctrl+C、Node REPL、GDB breakpoint、full-screen top を確認し、`--no-pty` では stdin/stdout/stderr の `isatty()` がすべて false、pipeline output も汚染されませんでした。
+
+## 4. Container-aware Runtime
+
+```toml
+[runtime]
+type = "docker"
+container = "isaaclab"
+runtime_root = "/workspace"
+```
+
+routed command / environment / PTY / job / forward / LSP / DAP / debugger / test discovery はすべて `Windows cwd → remote host cwd → runtime cwd` を共有します。host に存在しない container-only module `VALUE=4242` を `/workspace` で実行する Gate、container job orphan cleanup Gate も通過済みです。
+
+container forwarding は Docker bridge IP に依存しません。remote host loopback の session-scoped runtime relay が `docker/podman exec -i` で container loopback へ byte stream を bridge します。host→Docker bridge HTTP が実際に失敗する環境でも local `cf forward` は HTTP 200 を返しました。
+
+## 5. Remote IDE Bridge
+
+`cf lsp` / `cf debug` / `cf source read` / `cf test` は editor-agnostic API です。Windows path/URI と host/container path/URI を双方向 mapping し、workspace 外部 source は read-only `cloudfolder-runtime://<mount>/...` として local IDE から開けます。
+
+実 Formal Gate：Pyright diagnostics/completion/external definition、debugpy verified breakpoint + Windows stack path、pytest discovery/run、clangd 19 + real CUDA 13 `compile_commands.json` / header definition を確認済みです。
+
+Release の `CloudFolder-vscode.vsix` は LanguageClient / Testing / Python Debugger / runtime-source provider をこの API に接続する薄い reference extension で、**remote に VS Code Server を install しません**。
 
 ---
 
@@ -521,6 +571,14 @@ cf here
 cf status [mount]
 cf enter [mount]
 cf env [use <profile>|reload]
+cf runtime [check]
+cf transport status|stop|restart|bench [mount]
+cf lsp [--mount <mount>] python|clangd|rust|-- <server> [args...]
+cf debug dap [--mount <mount>] -- <adapter> [args...]
+cf debug python [--mount <mount>] [--local-port <port>] -- <program> [args...]
+cf source read [--mount <mount>] <absolute-runtime-path>
+cf test discover [--mount <mount>] [--framework pytest]
+cf test run [--mount <mount>] <pytest-nodeid>
 cf job run [mount] -- <program> [args...]
 cf job list [mount]
 cf job logs [-f] <job> [--mount <mount>]
@@ -532,7 +590,7 @@ cf forward stop <local-port|all> [--mount <mount>]
 cf add <ssh-config-host>
 cf flush [mount]
 cf refresh [mount]
-cf run [mount] -- <program> [args...]
+cf run [--pty|--no-pty] [mount] -- <program> [args...]
 cf sh [mount] -- <shell command>
 cf shell [mount]
 cf agent setup|status|remove
@@ -631,7 +689,7 @@ CloudFolder は managed block のみを：
 
 へ追加します。
 
-v0.7 では Agent / terminal を `cf enter` から起動し、その session では普通の Git / Python / build / test command を使うルールを優先します。`cf run` / `cf sh` は explicit remote exec / shell syntax 用です。
+v0.9 では Agent / terminal を `cf enter` から起動し、その session では普通の Git / Python / build / test command を使うルールを優先します。`cf run` / `cf sh` は explicit remote exec、Router 未登録 CLI、shell syntax 用です。
 
 Agent には：
 
@@ -837,6 +895,9 @@ cf refresh
 
 CloudFolder は現在 intentionally narrow です。
 
+- v0.9 の Remote Change Feed / Transport Broker helper / runtime relay は remote Linux の `python3` を必要とし、Change Feed は Linux inotify も必要です。mount 自体は継続できますが、該当 feature は理由を log に明示して fail/degrade し、realtime を偽装しません。
+- inotify は per-user の有限 resource です。CloudFolder は bounded budget を使い project root を優先します。mount の directory 数が quota を大きく超える場合は `service-*.log` に `degraded=true` を記録し、`cf refresh` を recovery として使用できます。
+- 約 100,000 file を 1 つの flat directory に置く layout は rclone/SFTP cold enumeration の performance boundary です。実 Gate では final cold entry の materialize に約 96.7s かかりましたが、Change Feed が periodic full-tree polling に fallback したわけではありません。
 - Beginner manager は現在主に **SFTP** を設定します。rclone の他 backend はまだ simple UI に全て公開していません。
 - **Live remote filesystem** であり、offline sync mirror ではありません。
 - network / server latency は残ります。

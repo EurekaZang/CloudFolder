@@ -19,6 +19,14 @@ jobs:
         run: cargo test
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: VS Code bridge syntax
+        shell: powershell
+        run: |
+          node --check .\editors\vscode\extension.js
+          node -e "JSON.parse(require('fs').readFileSync('.\\editors\\vscode\\package.json','utf8')); console.log('VS Code manifest OK')"
       - name: PowerShell 5.1 parse check
         shell: powershell
         run: |

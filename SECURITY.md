@@ -2,6 +2,15 @@
 
 CloudFolder is designed to run unattended as a Windows service, so it uses SSH public-key authentication rather than storing an SSH password.
 
+## v0.9 runtime surfaces
+
+- **Remote Change Feed:** the helper is started over the mount's existing strict SSH identity, runs only for the mount-service lifetime, needs no root, installs no permanent remote daemon, and is terminated with the service child tree. Its inotify usage is explicitly budgeted instead of intentionally consuming the user's entire watch quota.
+- **Persistent Transport Broker:** listens only on Windows loopback, authenticates each local request with a random per-mount token stored in CloudFolder's protected metadata, reuses strict SSH trust/key material, and falls back to fresh SSH rather than weakening authentication. Runtime upgrade stops only CloudFolder broker processes before replacing `cf.exe`.
+- **Container runtime:** `.cloudfolder.toml` is trusted executable workspace configuration. Selecting Docker/Podman gives the workspace the same authority the SSH account already has to invoke that runtime. CloudFolder does not expose the remote Docker socket to Windows.
+- **Runtime relay:** binds only to remote host loopback, is tagged with a random `CLOUDFOLDER_RELAY_ID`, and is stopped only after the matching `/proc/<pid>/environ` marker is verified. The local SSH tunnel also binds only to `127.0.0.1`.
+- **LSP / DAP / debugpy:** these commands intentionally execute language servers/debug adapters inside the selected remote runtime. `cloudfolder-runtime://` documents are read-only and are served through explicit `cf source read`; they are not projected as fake writable `C:\\usr\\...` files.
+- **Test discovery:** `cf test discover` and `cf test run` execute the workspace's remote pytest/plugins. Treat test configuration with the same trust level as running the project itself.
+
 ## Credential model
 
 - In direct host/IP mode, the default setup creates a dedicated `~/.ssh/cloudfolder_ed25519` key.

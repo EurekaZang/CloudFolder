@@ -5,3 +5,6 @@
 .DS_Store
 .idea/
 .vscode/
+/editors/vscode/node_modules/
+/editors/vscode/dist/
+/*.vsix

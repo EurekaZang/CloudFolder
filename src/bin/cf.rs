@@ -1,15 +1,20 @@
 use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::net::TcpListener;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use url::Url;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -52,6 +57,14 @@ const ROUTED_TOOLS: &[&str] = &[
     "bash",
     "sh",
     "nvidia-smi",
+    "true",
+    "false",
+    "ipython",
+    "gdb",
+    "lldb",
+    "top",
+    "htop",
+    "less",
 ];
 const AGENT_INSTRUCTIONS: &str = r#"## CloudFolder remote workspaces
 
@@ -102,6 +115,35 @@ struct MountRecord {
 struct WorkspaceConfig {
     #[serde(default)]
     environment: EnvironmentConfig,
+    #[serde(default)]
+    runtime: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeConfig {
+    #[serde(rename = "type", default = "default_runtime_type")]
+    kind: String,
+    #[serde(default)]
+    container: String,
+    #[serde(default)]
+    host_root: String,
+    #[serde(default)]
+    runtime_root: String,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_runtime_type(),
+            container: String::new(),
+            host_root: String::new(),
+            runtime_root: String::new(),
+        }
+    }
+}
+
+fn default_runtime_type() -> String {
+    "host".to_string()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -132,13 +174,87 @@ struct EffectiveEnvironment {
     active: String,
 }
 
+#[derive(Debug, Clone)]
+struct EffectiveRuntime {
+    kind: String,
+    container: String,
+    host_root: String,
+    runtime_root: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProtocolPathMapper {
+    mount_slug: String,
+    local_root: PathBuf,
+    runtime_root: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ForwardState {
     mount_slug: String,
     remote_port: u16,
     local_port: u16,
+    #[serde(default = "default_forward_host")]
+    remote_host: String,
+    #[serde(default)]
+    target_label: String,
+    #[serde(default)]
+    tunnel_port: u16,
+    #[serde(default)]
+    relay_pid: u32,
+    #[serde(default)]
+    relay_id: String,
     pid: u32,
     started_epoch: u64,
+}
+
+fn default_forward_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeForwardTarget {
+    host: String,
+    port: u16,
+    label: String,
+    relay_pid: u32,
+    relay_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransportState {
+    mount_slug: String,
+    port: u16,
+    pid: u32,
+    token: String,
+    started_epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TransportRequest {
+    token: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TestDiscovery {
+    framework: String,
+    root: String,
+    tests: Vec<DiscoveredTest>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveredTest {
+    id: String,
+    name: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtyMode {
+    Auto,
+    Force,
+    Never,
 }
 
 fn main() {
@@ -183,8 +299,14 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
         Some("status") => native_status(&args[1..]),
         Some("enter") => native_enter(&args[1..]),
         Some("env") => native_env(&args[1..]),
+        Some("runtime") => native_runtime(&args[1..]),
+        Some("lsp") => native_lsp(&args[1..]),
+        Some("debug") => native_debug(&args[1..]),
+        Some("source") => native_source(&args[1..]),
+        Some("test") => native_test(&args[1..]),
         Some("job") => native_job(&args[1..]),
         Some("forward") => native_forward(&args[1..]),
+        Some("transport") => native_transport(&args[1..]),
         Some("add") => native_add(&args[1..]),
         Some("ssh-proxy") => native_ssh_proxy(&args[1..]),
         Some("flush") => native_flush(&args[1..]),
@@ -206,6 +328,13 @@ fn print_usage() {
   cf status [mount]\n\
   cf enter [mount]\n\
   cf env [use <profile>|reload]\n\
+  cf runtime [check]\n\
+  cf lsp [--mount <mount>] python|clangd|rust|-- <server> [args...]\n\
+  cf debug dap [--mount <mount>] -- <adapter> [args...]\n\
+  cf debug python [--mount <mount>] [--local-port <port>] -- <program> [args...]\n\
+  cf source read [--mount <mount>] <absolute-runtime-path>\n\
+  cf test discover [--mount <mount>] [--framework pytest]\n\
+  cf test run [--mount <mount>] <pytest-nodeid>\n\
   cf job run [mount] -- <program> [args...]\n\
   cf job list [mount]\n\
   cf job logs [-f] <job> [--mount <mount>]\n\
@@ -214,6 +343,7 @@ fn print_usage() {
   cf forward <remote-port> [local-port] [--mount <mount>]\n\
   cf forward list [mount]\n\
   cf forward stop <local-port|all> [--mount <mount>]\n\
+  cf transport status|stop|restart|bench [mount]\n\
   cf add <ssh-config-host>\n\
   cf flush [mount]\n\
   cf refresh [mount]\n\
@@ -375,7 +505,7 @@ fn native_routed_tool(tool: &str, args: &[OsString]) -> Result<i32> {
     let mut command = Vec::with_capacity(args.len() + 1);
     command.push(OsString::from(tool));
     command.extend_from_slice(args);
-    execute_remote_argv(&record, &cwd, &command)
+    execute_remote_argv(&record, &cwd, &command, TtyMode::Auto)
 }
 
 fn routed_tool_from_exe_name(name: &str) -> Option<String> {
@@ -478,6 +608,528 @@ fn print_effective_environment(record: &MountRecord, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn native_runtime(args: &[OsString]) -> Result<i32> {
+    if args.len() > 1 || args.first().is_some_and(|arg| arg != OsStr::new("check")) {
+        bail!("usage: cf runtime [check]");
+    }
+    let entered = env::var("CLOUDFOLDER_ENTER_MOUNT").ok();
+    let record = resolve_mount(entered.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let host_cwd = remote_working_directory(&record, &cwd)?;
+    let runtime = effective_runtime(&record, &cwd)?;
+    let runtime_cwd = runtime_working_directory(&runtime, &host_cwd)?;
+    println!("Runtime:     {}", runtime.kind);
+    println!("Host cwd:    {host_cwd}");
+    println!("Runtime cwd: {runtime_cwd}");
+    if runtime.kind != "host" {
+        println!("Container:   {}", runtime.container);
+        let remote = format!(
+            "{} inspect -f {} {}",
+            runtime.kind,
+            quote_posix("{{.State.Running}}"),
+            quote_posix(&runtime.container)
+        );
+        let (code, stdout, stderr) = run_ssh_capture(&record, &remote)?;
+        if code != 0 || stdout.trim() != "true" {
+            bail!(
+                "{} container '{}' is not running: {}",
+                runtime.kind,
+                runtime.container,
+                stderr.trim()
+            );
+        }
+        println!("State:       running");
+    }
+    Ok(0)
+}
+
+fn native_lsp(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    if rest.is_empty() {
+        bail!("usage: cf lsp [--mount <mount>] python|clangd|rust|-- <server> [args...]");
+    }
+    let server = if rest[0] == OsStr::new("--") {
+        if rest.len() < 2 {
+            bail!("cf lsp -- requires a language server command");
+        }
+        argv_shell_text(&rest[1..])
+    } else {
+        match rest[0].to_string_lossy().to_ascii_lowercase().as_str() {
+            "python" => "if command -v pyright-langserver >/dev/null 2>&1; then exec pyright-langserver --stdio; elif command -v basedpyright-langserver >/dev/null 2>&1; then exec basedpyright-langserver --stdio; elif command -v pylsp >/dev/null 2>&1; then exec pylsp; else echo 'CloudFolder: install pyright, basedpyright, or python-lsp-server in the selected remote runtime' >&2; exit 127; fi".to_string(),
+            "clangd" | "cpp" | "c++" => "exec clangd --background-index".to_string(),
+            "rust" | "rust-analyzer" => "exec rust-analyzer".to_string(),
+            other => bail!("unknown LSP preset '{other}'; use cf lsp -- <server> [args...]"),
+        }
+    };
+    run_protocol_bridge(requested.as_deref(), &server, "LSP")
+}
+
+fn native_debug(args: &[OsString]) -> Result<i32> {
+    let Some(action) = args.first().and_then(|arg| arg.to_str()) else {
+        bail!("usage: cf debug dap [--mount <mount>] -- <adapter> [args...] | cf debug python ...");
+    };
+    match action {
+        "dap" => {
+            let (requested, rest) = extract_mount_flag(&args[1..])?;
+            if rest.first() != Some(&OsString::from("--")) || rest.len() < 2 {
+                bail!("usage: cf debug dap [--mount <mount>] -- <adapter> [args...]");
+            }
+            run_protocol_bridge(requested.as_deref(), &argv_shell_text(&rest[1..]), "DAP")
+        }
+        "python" => debug_python(&args[1..]),
+        _ => bail!(
+            "usage: cf debug dap [--mount <mount>] -- <adapter> [args...] | cf debug python ..."
+        ),
+    }
+}
+
+fn native_source(args: &[OsString]) -> Result<i32> {
+    let Some(action) = args.first().and_then(|arg| arg.to_str()) else {
+        bail!("usage: cf source read [--mount <mount>] <runtime-path>");
+    };
+    if !action.eq_ignore_ascii_case("read") {
+        bail!("usage: cf source read [--mount <mount>] <runtime-path>");
+    }
+    let (requested, rest) = extract_mount_flag(&args[1..])?;
+    if rest.len() != 1 {
+        bail!("usage: cf source read [--mount <mount>] <runtime-path>");
+    }
+    let runtime_path = rest[0].to_string_lossy().to_string();
+    if !runtime_path.starts_with('/') || runtime_path.contains(['\r', '\n']) {
+        bail!("runtime source path must be an absolute Linux path");
+    }
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let (code, stdout, stderr) = run_runtime_capture(
+        &record,
+        &cwd,
+        &format!("cat -- {}", quote_posix(&runtime_path)),
+    )?;
+    if code != 0 {
+        bail!(
+            "could not read runtime source '{}': {}",
+            runtime_path,
+            stderr.trim()
+        );
+    }
+    print!("{stdout}");
+    Ok(0)
+}
+
+fn native_test(args: &[OsString]) -> Result<i32> {
+    let Some(action) = args.first().and_then(|arg| arg.to_str()) else {
+        bail!("usage: cf test discover [--mount <mount>] [--framework pytest] | cf test run [--mount <mount>] <pytest-nodeid>");
+    };
+    match action.to_ascii_lowercase().as_str() {
+        "discover" => test_discover(&args[1..]),
+        "run" => test_run(&args[1..]),
+        _ => bail!("usage: cf test discover [--mount <mount>] [--framework pytest] | cf test run [--mount <mount>] <pytest-nodeid>"),
+    }
+}
+
+fn test_discover(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    let mut framework = "pytest".to_string();
+    let mut index = 0;
+    while index < rest.len() {
+        if rest[index] == OsStr::new("--framework") {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("--framework requires a value"))?;
+            framework = value.to_string_lossy().to_ascii_lowercase();
+            index += 2;
+        } else {
+            bail!("usage: cf test discover [--mount <mount>] [--framework pytest]");
+        }
+    }
+    if framework != "pytest" {
+        bail!("unsupported test framework '{framework}'; currently supported: pytest");
+    }
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    wait_for_flush(&record, Duration::from_secs(60))?;
+    let (code, stdout, stderr) = run_runtime_capture(
+        &record,
+        &cwd,
+        "python3 -m pytest --collect-only -q --disable-warnings",
+    )?;
+    if !matches!(code, 0 | 5) {
+        bail!(
+            "pytest discovery failed (exit {code}): {}{}",
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", stdout.trim())
+            }
+        );
+    }
+    let mut tests = Vec::new();
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("::"))
+    {
+        let Some(file) = line.split("::").next() else {
+            continue;
+        };
+        if !file.to_ascii_lowercase().ends_with(".py") {
+            continue;
+        }
+        let mut local_path = cwd.clone();
+        for part in file.split(['/', '\\']).filter(|part| !part.is_empty()) {
+            local_path.push(part);
+        }
+        let name = line.rsplit("::").next().unwrap_or(line).to_string();
+        tests.push(DiscoveredTest {
+            id: line.to_string(),
+            name,
+            path: local_path.to_string_lossy().to_string(),
+        });
+    }
+    tests.sort_by(|a, b| a.id.cmp(&b.id));
+    tests.dedup_by(|a, b| a.id == b.id);
+    let discovery = TestDiscovery {
+        framework,
+        root: cwd.to_string_lossy().to_string(),
+        tests,
+    };
+    println!("{}", serde_json::to_string(&discovery)?);
+    Ok(0)
+}
+
+fn test_run(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    if rest.len() != 1 {
+        bail!("usage: cf test run [--mount <mount>] <pytest-nodeid>");
+    }
+    let node_id = rest[0].to_string_lossy().to_string();
+    if node_id.trim().is_empty() || node_id.contains(['\r', '\n']) {
+        bail!("pytest node id is invalid");
+    }
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let command = vec![
+        OsString::from("python3"),
+        OsString::from("-m"),
+        OsString::from("pytest"),
+        OsString::from("-q"),
+        OsString::from(node_id),
+    ];
+    execute_remote_argv(&record, &cwd, &command, TtyMode::Never)
+}
+
+fn argv_shell_text(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| quote_posix(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_protocol_bridge(requested: Option<&str>, server: &str, label: &str) -> Result<i32> {
+    let record = resolve_mount(requested, true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let host_cwd = remote_working_directory(&record, &cwd)?;
+    let runtime = effective_runtime(&record, &cwd)?;
+    let runtime_cwd = runtime_working_directory(&runtime, &host_cwd)?;
+    let environment = effective_environment(&record, &cwd)?;
+    let mapper = protocol_path_mapper(&record, &cwd, &runtime)?;
+    wait_for_flush(&record, Duration::from_secs(60))?;
+
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&runtime_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\n");
+    body.push_str(server);
+    let inner = wrap_environment_shell(&environment, &body);
+    let remote_command = wrap_runtime_command(&runtime, &runtime_cwd, &inner, false, true);
+    let mut ssh = ssh_command(&record)?;
+    let mut child = ssh
+        .arg(ssh_target(&record))
+        .arg(remote_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("starting remote {label} server"))?;
+    let remote_in = child
+        .stdin
+        .take()
+        .context("remote protocol stdin unavailable")?;
+    let remote_out = child
+        .stdout
+        .take()
+        .context("remote protocol stdout unavailable")?;
+    let client_mapper = mapper.clone();
+    let _input_thread = thread::spawn(move || -> Result<()> {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut writer = remote_in;
+        while let Some(body) = read_protocol_message(&mut reader)? {
+            let rewritten = rewrite_protocol_json(&body, &client_mapper, true)?;
+            write_protocol_message(&mut writer, &rewritten)?;
+        }
+        Ok(())
+    });
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let mut reader = BufReader::new(remote_out);
+    while let Some(body) = read_protocol_message(&mut reader)? {
+        let rewritten = rewrite_protocol_json(&body, &mapper, false)?;
+        write_protocol_message(&mut writer, &rewritten)?;
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for remote {label} server"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn debug_python(args: &[OsString]) -> Result<i32> {
+    let (requested, rest) = extract_mount_flag(args)?;
+    let mut local_port = None;
+    let mut command = Vec::new();
+    let mut index = 0;
+    let mut after_delimiter = false;
+    while index < rest.len() {
+        if after_delimiter {
+            command.push(rest[index].clone());
+            index += 1;
+            continue;
+        }
+        if rest[index] == OsStr::new("--") {
+            after_delimiter = true;
+            index += 1;
+        } else if rest[index] == OsStr::new("--local-port") {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("--local-port requires a port"))?;
+            local_port = Some(parse_port(value, "local debug port")?);
+            index += 2;
+        } else {
+            bail!("usage: cf debug python [--mount <mount>] [--local-port <port>] -- <program> [args...]");
+        }
+    }
+    if command.is_empty() {
+        bail!("cf debug python requires a program after --");
+    }
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let runtime = effective_runtime(&record, &cwd)?;
+    let mapper = protocol_path_mapper(&record, &cwd, &runtime)?;
+
+    let (check_code, _, check_stderr) =
+        run_runtime_capture(&record, &cwd, "python3 -c 'import debugpy'")?;
+    if check_code != 0 {
+        bail!(
+            "debugpy is not installed in the selected remote runtime: {}",
+            check_stderr.trim()
+        );
+    }
+    let (port_code, port_stdout, port_stderr) = run_runtime_capture(
+        &record,
+        &cwd,
+        "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'",
+    )?;
+    if port_code != 0 {
+        bail!(
+            "could not allocate remote debug port: {}",
+            port_stderr.trim()
+        );
+    }
+    let remote_port: u16 = port_stdout
+        .trim()
+        .parse()
+        .context("remote runtime returned an invalid debug port")?;
+    let local_port = choose_local_port(local_port.unwrap_or(remote_port), local_port.is_some())?;
+    let target = start_runtime_forward_target(&record, &runtime, remote_port)?;
+
+    let mut forward = ssh_command(&record)?;
+    forward
+        .arg("-N")
+        .arg("-L")
+        .arg(format!(
+            "127.0.0.1:{local_port}:{}:{}",
+            target.host, target.port
+        ))
+        .args(["-o", "ExitOnForwardFailure=yes"])
+        .arg(ssh_target(&record))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    forward.creation_flags(0x0800_0000);
+    let mut forward_child = forward.spawn().context("starting debug port forward")?;
+    thread::sleep(Duration::from_millis(500));
+    if let Some(status) = forward_child.try_wait()? {
+        let _ = stop_runtime_relay(&record, target.relay_pid, &target.relay_id);
+        bail!("debug port forward exited immediately with {status}");
+    }
+
+    let program = command.remove(0);
+    let mapped_program = {
+        let path = PathBuf::from(&program);
+        if path.is_absolute() {
+            mapper
+                .local_path_to_runtime(&path)
+                .map(OsString::from)
+                .unwrap_or(program)
+        } else {
+            program
+        }
+    };
+    let debug_wrapper = format!(
+        "import debugpy,runpy,sys; debugpy.listen(('0.0.0.0',{remote_port})); print('CLOUDFOLDER_DEBUG_READY', flush=True); debugpy.wait_for_client(); program=sys.argv[1]; sys.argv=sys.argv[1:]; runpy.run_path(program, run_name='__main__')"
+    );
+    let mut debug_argv = vec![
+        OsString::from("python3"),
+        OsString::from("-Xfrozen_modules=off"),
+        OsString::from("-c"),
+        OsString::from(debug_wrapper),
+        mapped_program,
+    ];
+    debug_argv.extend(command);
+
+    let host_cwd = remote_working_directory(&record, &cwd)?;
+    let runtime_cwd = runtime_working_directory(&runtime, &host_cwd)?;
+    let environment = effective_environment(&record, &cwd)?;
+    wait_for_flush(&record, Duration::from_secs(60))?;
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&runtime_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\nexec");
+    for arg in &debug_argv {
+        body.push(' ');
+        body.push_str(&quote_posix(&arg.to_string_lossy()));
+    }
+    let inner = wrap_environment_shell(&environment, &body);
+    let remote_command = wrap_runtime_command(&runtime, &runtime_cwd, &inner, false, true);
+    let mut debug_ssh = ssh_command(&record)?;
+    debug_ssh
+        .arg(ssh_target(&record))
+        .arg(remote_command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut debug_child = match debug_ssh.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = forward_child.kill();
+            let _ = forward_child.wait();
+            let _ = stop_runtime_relay(&record, target.relay_pid, &target.relay_id);
+            return Err(error).context("starting remote debugpy runtime");
+        }
+    };
+    let debug_stdout = debug_child
+        .stdout
+        .take()
+        .context("remote debugpy stdout unavailable")?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    let debug_output_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(debug_stdout);
+        let mut line = String::new();
+        let mut ready_sent = false;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    if !ready_sent {
+                        let _ =
+                            ready_tx
+                                .send(Err("remote debugpy exited before opening its DAP listener"
+                                    .to_string()));
+                    }
+                    break;
+                }
+                Ok(_)
+                    if !ready_sent
+                        && line.trim_end_matches(['\r', '\n']) == "CLOUDFOLDER_DEBUG_READY" =>
+                {
+                    ready_sent = true;
+                    let _ = ready_tx.send(Ok(()));
+                }
+                Ok(_) => {
+                    let mut local_stdout = io::stdout().lock();
+                    let _ = local_stdout.write_all(line.as_bytes());
+                    let _ = local_stdout.flush();
+                }
+                Err(error) => {
+                    if !ready_sent {
+                        let _ = ready_tx.send(Err(format!(
+                            "could not read remote debugpy readiness: {error}"
+                        )));
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    println!("CloudFolder Python debug bridge");
+    println!("Attach:      127.0.0.1:{local_port}");
+    println!("Local root:  {}", mapper.local_root.display());
+    println!("Remote root: {}", mapper.runtime_root);
+    println!("Runtime:     {}", runtime.kind);
+    if runtime.kind != "host" {
+        println!("Container:   {}", runtime.container);
+    }
+    match ready_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            let _ = debug_child.kill();
+            let _ = debug_child.wait();
+            let _ = debug_output_thread.join();
+            let _ = forward_child.kill();
+            let _ = forward_child.wait();
+            let _ = stop_runtime_relay(&record, target.relay_pid, &target.relay_id);
+            bail!("{message}");
+        }
+        Err(_) => {
+            let _ = debug_child.kill();
+            let _ = debug_child.wait();
+            let _ = debug_output_thread.join();
+            let _ = forward_child.kill();
+            let _ = forward_child.wait();
+            let _ = stop_runtime_relay(&record, target.relay_pid, &target.relay_id);
+            bail!("timed out waiting for remote debugpy DAP listener");
+        }
+    }
+    println!("Waiting for a DAP client to attach...");
+    let debug_status = debug_child
+        .wait()
+        .context("waiting for remote debugpy runtime")?;
+    let _ = debug_output_thread.join();
+    let _ = forward_child.kill();
+    let _ = forward_child.wait();
+    let _ = stop_runtime_relay(&record, target.relay_pid, &target.relay_id);
+    let _ = refresh_vfs(&record);
+    Ok(debug_status.code().unwrap_or(1))
+}
+
+fn run_runtime_capture(
+    record: &MountRecord,
+    cwd: &Path,
+    shell_text: &str,
+) -> Result<(i32, String, String)> {
+    let host_cwd = remote_working_directory(record, cwd)?;
+    let runtime = effective_runtime(record, cwd)?;
+    let runtime_cwd = runtime_working_directory(&runtime, &host_cwd)?;
+    let environment = effective_environment(record, cwd)?;
+    let mut body = format!("set -e\ncd -- {}\n", quote_posix(&runtime_cwd));
+    if !environment.init.trim().is_empty() {
+        body.push_str(environment.init.trim_end());
+        body.push('\n');
+    }
+    body.push_str("set +e\n");
+    body.push_str(shell_text);
+    let inner = wrap_environment_shell(&environment, &body);
+    let remote = wrap_runtime_command(&runtime, &runtime_cwd, &inner, false, false);
+    run_ssh_capture(record, &remote)
+}
+
 fn native_add(args: &[OsString]) -> Result<i32> {
     if args.len() != 1 {
         bail!("usage: cf add <ssh-config-host>");
@@ -563,7 +1215,9 @@ fn job_run(args: &[OsString]) -> Result<i32> {
     let (requested, command) = split_remote_command(args)?;
     let record = resolve_mount(requested.as_deref(), true)?;
     let cwd = env::current_dir().context("cannot read the current directory")?;
-    let remote_cwd = remote_working_directory(&record, &cwd)?;
+    let host_cwd = remote_working_directory(&record, &cwd)?;
+    let runtime = effective_runtime(&record, &cwd)?;
+    let remote_cwd = runtime_working_directory(&runtime, &host_cwd)?;
     let environment = effective_environment(&record, &cwd)?;
     wait_for_flush(&record, Duration::from_secs(60))?;
     let id = new_job_id();
@@ -579,24 +1233,33 @@ fn job_run(args: &[OsString]) -> Result<i32> {
         body.push('\n');
     }
     body.push_str("set +e\n");
-    body.push_str(&format!(
-        "{command_text}\nrc=$?\nprintf '%s\\n' \"$rc\" > {job_dir}/exit_code\nprintf 'exited\\n' > {job_dir}/state\nexit \"$rc\""
-    ));
+    body.push_str(&command_text);
     let body = wrap_environment_shell(&environment, &body);
+    let runtime_command = wrap_runtime_job_command(&runtime, &remote_cwd, &body, &id);
+    let durable_body = format!(
+        "set +e\n{runtime_command}\nrc=$?\nprintf '%s\\n' \"$rc\" > {job_dir}/exit_code\nprintf 'exited\\n' > {job_dir}/state\nexit \"$rc\""
+    );
     let display_command = command
         .iter()
         .map(|arg| arg.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
     let remote = format!(
-        "set -eu; d={job_dir}; mkdir -p \"$d\"; printf '%s\\n' {} > \"$d/cwd\"; printf '%s\\n' {} > \"$d/command\"; date +%s > \"$d/started\"; : > \"$d/stdout.log\"; if command -v setsid >/dev/null 2>&1; then nohup setsid sh -lc {} > \"$d/stdout.log\" 2>&1 < /dev/null & printf 'setsid\\n' > \"$d/mode\"; else nohup sh -lc {} > \"$d/stdout.log\" 2>&1 < /dev/null & printf 'plain\\n' > \"$d/mode\"; fi; p=$!; printf '%s\\n' \"$p\" > \"$d/pid\"; printf 'running\\n' > \"$d/state\"; printf '%s\\t%s\\n' {} \"$p\"",
+        "set -eu; d={job_dir}; mkdir -p \"$d\"; printf '%s\\n' {} > \"$d/cwd\"; printf '%s\\n' {} > \"$d/command\"; printf '%s\\n' {} > \"$d/runtime_kind\"; printf '%s\\n' {} > \"$d/runtime_container\"; date +%s > \"$d/started\"; : > \"$d/stdout.log\"; if command -v setsid >/dev/null 2>&1; then nohup setsid sh -lc {} > \"$d/stdout.log\" 2>&1 < /dev/null & printf 'setsid\\n' > \"$d/mode\"; else nohup sh -lc {} > \"$d/stdout.log\" 2>&1 < /dev/null & printf 'plain\\n' > \"$d/mode\"; fi; p=$!; printf '%s\\n' \"$p\" > \"$d/pid\"; printf 'running\\n' > \"$d/state\"; printf '%s\\t%s\\n' {} \"$p\"",
         quote_posix(&remote_cwd),
         quote_posix(&display_command),
-        quote_posix(&body),
-        quote_posix(&body),
+        quote_posix(&runtime.kind),
+        quote_posix(&runtime.container),
+        quote_posix(&durable_body),
+        quote_posix(&durable_body),
         quote_posix(&id),
     );
-    let (code, stdout, stderr) = run_ssh_capture(&record, &remote)?;
+    // Detached launch semantics intentionally bypass the persistent transport.
+    // A background descendant can keep inherited descriptors alive after the
+    // launch shell exits, which makes a multiplexed stdio broker unable to
+    // determine the launch boundary reliably. One fresh SSH launch preserves
+    // normal nohup/setsid behavior; job queries still use the warm broker.
+    let (code, stdout, stderr) = fresh_ssh_capture(&record, &remote)?;
     if code != 0 {
         bail!("could not start persistent job: {}", stderr.trim());
     }
@@ -658,8 +1321,12 @@ fn job_stop(args: &[OsString]) -> Result<i32> {
     validate_job_id(&id)?;
     let record = resolve_mount(requested.as_deref(), true)?;
     let d = format!("$HOME/.cloudfolder/jobs/{id}");
+    let container_marker = quote_posix(&format!("CLOUDFOLDER_JOB_ID={id}"));
+    let container_scan = quote_posix(&format!(
+        "for e in /proc/[0-9]*/environ; do [ -r \"$e\" ] || continue; if tr '\\000' '\\n' < \"$e\" | grep -qx {container_marker}; then p=${{e#/proc/}}; p=${{p%/environ}}; kill -TERM \"$p\" 2>/dev/null || true; fi; done"
+    ));
     let remote = format!(
-        "set -eu; d={d}; test -d \"$d\"; p=$(cat \"$d/pid\"); mode=$(cat \"$d/mode\" 2>/dev/null || echo plain); if kill -0 \"$p\" 2>/dev/null; then if [ \"$mode\" = setsid ]; then kill -TERM -- -\"$p\" 2>/dev/null || kill -TERM \"$p\"; else kill -TERM \"$p\"; fi; fi; printf 'stopped\\n' > \"$d/state\"; printf 'stopped %s\\n' {}",
+        "set -eu; d={d}; test -d \"$d\"; kind=$(cat \"$d/runtime_kind\" 2>/dev/null || echo host); container=$(cat \"$d/runtime_container\" 2>/dev/null || true); if [ \"$kind\" = docker ] || [ \"$kind\" = podman ]; then \"$kind\" exec \"$container\" sh -lc {container_scan} 2>/dev/null || true; fi; p=$(cat \"$d/pid\"); mode=$(cat \"$d/mode\" 2>/dev/null || echo plain); if kill -0 \"$p\" 2>/dev/null; then if [ \"$mode\" = setsid ]; then kill -TERM -- -\"$p\" 2>/dev/null || kill -TERM \"$p\"; else kill -TERM \"$p\"; fi; fi; printf 'stopped\\n' > \"$d/state\"; printf 'stopped %s\\n' {}",
         quote_posix(&id)
     );
     run_ssh(&record, false, &remote)
@@ -709,6 +1376,9 @@ fn forward_start(args: &[OsString]) -> Result<i32> {
         None
     };
     let record = resolve_mount(requested.as_deref(), true)?;
+    let cwd = env::current_dir().context("cannot read the current directory")?;
+    let runtime = effective_runtime(&record, &cwd)?;
+    let target = start_runtime_forward_target(&record, &runtime, remote_port)?;
     let local_port = choose_local_port(
         requested_local.unwrap_or(remote_port),
         requested_local.is_some(),
@@ -717,7 +1387,10 @@ fn forward_start(args: &[OsString]) -> Result<i32> {
     command
         .arg("-N")
         .arg("-L")
-        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
+        .arg(format!(
+            "127.0.0.1:{local_port}:{}:{}",
+            target.host, target.port
+        ))
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
         .arg(ssh_target(&record));
@@ -732,12 +1405,18 @@ fn forward_start(args: &[OsString]) -> Result<i32> {
         .context("failed to start SSH port forward")?;
     thread::sleep(Duration::from_millis(600));
     if let Some(status) = child.try_wait().context("cannot inspect SSH forward")? {
+        let _ = stop_runtime_relay(&record, target.relay_pid, &target.relay_id);
         bail!("SSH port forward exited immediately with {status}");
     }
     let state = ForwardState {
         mount_slug: record.slug.clone(),
         remote_port,
         local_port,
+        remote_host: target.host.clone(),
+        target_label: target.label.clone(),
+        tunnel_port: target.port,
+        relay_pid: target.relay_pid,
+        relay_id: target.relay_id.clone(),
         pid: child.id(),
         started_epoch: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -746,8 +1425,8 @@ fn forward_start(args: &[OsString]) -> Result<i32> {
     };
     save_forward_state(&record, &state)?;
     println!(
-        "Forward active: {} remote 127.0.0.1:{} -> 127.0.0.1:{} (pid {})",
-        record.name, remote_port, local_port, state.pid
+        "Forward active: {} {}:{} -> 127.0.0.1:{} (pid {})",
+        record.name, target.label, remote_port, local_port, state.pid
     );
     println!("Web URL (if applicable): http://127.0.0.1:{local_port}/");
     Ok(0)
@@ -764,10 +1443,15 @@ fn forward_list(args: &[OsString]) -> Result<i32> {
     println!("Local\tRemote\tPID\tState");
     for state in states {
         let active = forward_process_matches(&state);
+        let remote = if state.target_label.is_empty() {
+            format!("{}:{}", state.remote_host, state.remote_port)
+        } else {
+            format!("{}:{}", state.target_label, state.remote_port)
+        };
         println!(
             "{}\t{}\t{}\t{}",
             state.local_port,
-            state.remote_port,
+            remote,
             state.pid,
             if active { "running" } else { "stale" }
         );
@@ -801,6 +1485,7 @@ fn forward_stop(args: &[OsString]) -> Result<i32> {
                 .stderr(Stdio::null())
                 .status();
         }
+        let _ = stop_runtime_relay(&record, state.relay_pid, &state.relay_id);
         let _ = fs::remove_file(forward_state_path(&record, state.local_port));
         println!("Stopped forward localhost:{}.", state.local_port);
     }
@@ -808,6 +1493,424 @@ fn forward_stop(args: &[OsString]) -> Result<i32> {
         bail!("no matching forward was found");
     }
     Ok(0)
+}
+
+fn native_transport(args: &[OsString]) -> Result<i32> {
+    let action = args
+        .first()
+        .and_then(|value| value.to_str())
+        .unwrap_or("status")
+        .to_ascii_lowercase();
+    match action.as_str() {
+        "serve" => {
+            if args.len() != 2 {
+                bail!("usage: cf transport serve <mount>");
+            }
+            transport_serve(&args[1].to_string_lossy())
+        }
+        "status" => {
+            let requested = single_optional_name(&args[1..])?;
+            let record = resolve_mount(requested.as_deref(), true)?;
+            match load_transport_state(&record)? {
+                Some(state) if transport_state_alive(&state) => println!(
+                    "Transport: warm\nMount:     {}\nPID:       {}\nLocal:     127.0.0.1:{}",
+                    record.name, state.pid, state.port
+                ),
+                _ => println!("Transport: cold\nMount:     {}", record.name),
+            }
+            Ok(0)
+        }
+        "stop" => {
+            let requested = single_optional_name(&args[1..])?;
+            let record = resolve_mount(requested.as_deref(), true)?;
+            stop_transport(&record)?;
+            println!("Stopped transport for {}.", record.name);
+            Ok(0)
+        }
+        "restart" => {
+            let requested = single_optional_name(&args[1..])?;
+            let record = resolve_mount(requested.as_deref(), true)?;
+            let _ = stop_transport(&record);
+            let state = ensure_transport(&record)?;
+            println!(
+                "Transport ready: {} pid={} local=127.0.0.1:{}",
+                record.name, state.pid, state.port
+            );
+            Ok(0)
+        }
+        "bench" => transport_bench(&args[1..]),
+        _ => bail!("usage: cf transport status|stop|restart|bench [mount]"),
+    }
+}
+
+fn transport_bench(args: &[OsString]) -> Result<i32> {
+    if args.len() > 2 {
+        bail!("usage: cf transport bench [mount] [count]");
+    }
+    let (requested, count) = if args.len() == 2 {
+        (
+            Some(args[0].to_string_lossy().to_string()),
+            args[1]
+                .to_string_lossy()
+                .parse::<usize>()
+                .context("transport bench count must be an integer")?,
+        )
+    } else if args.len() == 1 {
+        let text = args[0].to_string_lossy();
+        match text.parse::<usize>() {
+            Ok(count) => (None, count),
+            Err(_) => (Some(text.to_string()), 100),
+        }
+    } else {
+        (None, 100)
+    };
+    if count == 0 || count > 10_000 {
+        bail!("transport bench count must be between 1 and 10000");
+    }
+    let record = resolve_mount(requested.as_deref(), true)?;
+    let _ = stop_transport(&record);
+    let cold_started = Instant::now();
+    let (cold_code, _, cold_stderr) = fresh_ssh_capture(&record, "true")?;
+    let cold_ms = cold_started.elapsed().as_secs_f64() * 1000.0;
+    if cold_code != 0 {
+        bail!("fresh SSH baseline failed: {}", cold_stderr.trim());
+    }
+    let _ = ensure_transport(&record)?;
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count {
+        let started = Instant::now();
+        let (code, _, stderr) = run_via_transport_capture(&record, "true")?;
+        if code != 0 {
+            bail!("warm transport command failed: {}", stderr.trim());
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let p50 = samples[samples.len() / 2];
+    let p95_index = ((samples.len() as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(samples.len() - 1);
+    let p95 = samples[p95_index];
+    println!("Mount: {}", record.name);
+    println!("Fresh SSH baseline: {cold_ms:.1} ms");
+    println!("Warm commands: {count}");
+    println!("Warm P50: {p50:.1} ms");
+    println!("Warm P95: {p95:.1} ms");
+    println!("Speedup(P50): {:.1}x", cold_ms / p50.max(0.1));
+    Ok(0)
+}
+
+fn transport_state_path(record: &MountRecord) -> PathBuf {
+    mount_data_dir(record).join("transport.json")
+}
+
+fn load_transport_state(record: &MountRecord) -> Result<Option<TransportState>> {
+    let path = transport_state_path(record);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let state: TransportState = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid transport state {}", path.display()))?;
+    Ok(state
+        .mount_slug
+        .eq_ignore_ascii_case(&record.slug)
+        .then_some(state))
+}
+
+fn save_transport_state(record: &MountRecord, state: &TransportState) -> Result<()> {
+    let path = transport_state_path(record);
+    let bytes = serde_json::to_vec_pretty(state).context("serializing transport state")?;
+    fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))
+}
+
+fn transport_state_alive(state: &TransportState) -> bool {
+    let address = format!("127.0.0.1:{}", state.port)
+        .parse()
+        .expect("loopback transport address is valid");
+    TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok()
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| anyhow!("generating transport token failed: {err}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn ensure_transport(record: &MountRecord) -> Result<TransportState> {
+    if let Some(state) = load_transport_state(record)? {
+        if transport_state_alive(&state) {
+            return Ok(state);
+        }
+        let _ = fs::remove_file(transport_state_path(record));
+    }
+    let cf = runtime_dir()?.join("cf.exe");
+    let mut command = Command::new(cf);
+    command
+        .args(["transport", "serve", &record.slug])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let _child = command
+        .spawn()
+        .context("starting CloudFolder transport broker")?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(state) = load_transport_state(record)? {
+            if transport_state_alive(&state) {
+                return Ok(state);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "transport broker for '{}' did not become ready",
+                record.name
+            );
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+}
+
+fn stop_transport(record: &MountRecord) -> Result<()> {
+    let Some(state) = load_transport_state(record)? else {
+        return Ok(());
+    };
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &state.pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = fs::remove_file(transport_state_path(record));
+    Ok(())
+}
+
+fn transport_serve(mount: &str) -> Result<i32> {
+    let record = resolve_mount(Some(mount), false)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("binding transport broker")?;
+    let port = listener.local_addr()?.port();
+    let token = random_token()?;
+    let remote = format!(
+        "exec python3 -u -c {}",
+        quote_posix(&remote_transport_script())
+    );
+    let mut ssh = ssh_command(&record)?;
+    let mut child = ssh
+        .arg(ssh_target(&record))
+        .arg(remote)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting persistent SSH transport")?;
+    let mut ssh_in = child
+        .stdin
+        .take()
+        .context("transport SSH stdin unavailable")?;
+    let ssh_out = child
+        .stdout
+        .take()
+        .context("transport SSH stdout unavailable")?;
+    let mut ssh_out = BufReader::new(ssh_out);
+    let mut ready = String::new();
+    ssh_out.read_line(&mut ready)?;
+    if ready.trim() != "CLOUDFOLDER_TRANSPORT_READY" {
+        let _ = child.kill();
+        bail!(
+            "remote transport helper did not become ready: {}",
+            ready.trim()
+        );
+    }
+    let state = TransportState {
+        mount_slug: record.slug.clone(),
+        port,
+        pid: std::process::id(),
+        token: token.clone(),
+        started_epoch: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    save_transport_state(&record, &state)?;
+    for incoming in listener.incoming() {
+        let Ok(mut stream) = incoming else {
+            continue;
+        };
+        let request: TransportRequest = match read_json_frame(&mut stream) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        if request.token != token {
+            let _ = write_transport_frame(&mut stream, b'X', &2i32.to_be_bytes());
+            continue;
+        }
+        let request_json = serde_json::to_vec(&serde_json::json!({
+            "command": request.command
+        }))
+        .context("serializing remote transport request")?;
+        writeln!(ssh_in, "{}", BASE64.encode(request_json))?;
+        ssh_in.flush()?;
+        loop {
+            let mut line = String::new();
+            if ssh_out.read_line(&mut line)? == 0 {
+                let _ = fs::remove_file(transport_state_path(&record));
+                let _ = child.kill();
+                bail!("persistent SSH transport disconnected");
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if let Some(encoded) = line.strip_prefix("O ") {
+                let bytes = BASE64
+                    .decode(encoded)
+                    .context("decoding transport stdout")?;
+                write_transport_frame(&mut stream, b'O', &bytes)?;
+            } else if let Some(encoded) = line.strip_prefix("E ") {
+                let bytes = BASE64
+                    .decode(encoded)
+                    .context("decoding transport stderr")?;
+                write_transport_frame(&mut stream, b'E', &bytes)?;
+            } else if let Some(code) = line.strip_prefix("X ") {
+                let code: i32 = code.parse().context("invalid transport exit code")?;
+                write_transport_frame(&mut stream, b'X', &code.to_be_bytes())?;
+                break;
+            }
+        }
+    }
+    let _ = fs::remove_file(transport_state_path(&record));
+    let _ = child.kill();
+    Ok(0)
+}
+
+fn write_json_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec(value).context("serializing transport request")?;
+    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    stream.write_all(&bytes)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_json_frame<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> Result<T> {
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > 16 * 1024 * 1024 {
+        bail!("transport request is too large");
+    }
+    let mut bytes = vec![0u8; len];
+    stream.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes).context("decoding transport request")
+}
+
+fn write_transport_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> Result<()> {
+    stream.write_all(&[kind])?;
+    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_transport_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+    let mut kind = [0u8; 1];
+    stream.read_exact(&mut kind)?;
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > 64 * 1024 * 1024 {
+        bail!("transport response frame is too large");
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok((kind[0], payload))
+}
+
+fn run_via_transport_capture(
+    record: &MountRecord,
+    remote_command: &str,
+) -> Result<(i32, String, String)> {
+    let state = ensure_transport(record)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", state.port))
+        .context("connecting to CloudFolder transport broker")?;
+    write_json_frame(
+        &mut stream,
+        &TransportRequest {
+            token: state.token,
+            command: remote_command.to_string(),
+        },
+    )?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    loop {
+        let (kind, payload) = read_transport_frame(&mut stream)?;
+        match kind {
+            b'O' => stdout.extend_from_slice(&payload),
+            b'E' => stderr.extend_from_slice(&payload),
+            b'X' if payload.len() == 4 => {
+                let code = i32::from_be_bytes(payload.try_into().expect("checked length"));
+                return Ok((
+                    code,
+                    String::from_utf8_lossy(&stdout).to_string(),
+                    String::from_utf8_lossy(&stderr).to_string(),
+                ));
+            }
+            _ => bail!("invalid transport response frame"),
+        }
+    }
+}
+
+fn run_via_transport(record: &MountRecord, remote_command: &str) -> Result<i32> {
+    let state = ensure_transport(record)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", state.port))
+        .context("connecting to CloudFolder transport broker")?;
+    write_json_frame(
+        &mut stream,
+        &TransportRequest {
+            token: state.token,
+            command: remote_command.to_string(),
+        },
+    )?;
+    loop {
+        let (kind, payload) = read_transport_frame(&mut stream)?;
+        match kind {
+            b'O' => {
+                io::stdout().write_all(&payload)?;
+                io::stdout().flush()?;
+            }
+            b'E' => {
+                io::stderr().write_all(&payload)?;
+                io::stderr().flush()?;
+            }
+            b'X' if payload.len() == 4 => {
+                return Ok(i32::from_be_bytes(
+                    payload.try_into().expect("checked length"),
+                ));
+            }
+            _ => bail!("invalid transport response frame"),
+        }
+    }
+}
+
+fn remote_transport_script() -> String {
+    r#"import base64,json,os,selectors,subprocess,sys
+print('CLOUDFOLDER_TRANSPORT_READY',flush=True)
+for raw in sys.stdin.buffer:
+    if not raw.strip(): continue
+    req=json.loads(base64.b64decode(raw))
+    p=subprocess.Popen(req['command'],shell=True,executable='/bin/sh',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    sel=selectors.DefaultSelector()
+    sel.register(p.stdout,selectors.EVENT_READ,'O')
+    sel.register(p.stderr,selectors.EVENT_READ,'E')
+    while sel.get_map():
+        for key,mask in sel.select():
+            data=os.read(key.fileobj.fileno(),32768)
+            if data:
+                print(key.data+' '+base64.b64encode(data).decode('ascii'),flush=True)
+            else:
+                sel.unregister(key.fileobj)
+    code=p.wait()
+    print('X '+str(code),flush=True)
+"#
+    .to_string()
 }
 
 fn native_agent(args: &[OsString]) -> Result<i32> {
@@ -875,10 +1978,10 @@ fn native_refresh(args: &[OsString]) -> Result<i32> {
 }
 
 fn native_run(args: &[OsString]) -> Result<i32> {
-    let (requested, command) = split_remote_command(args)?;
+    let (requested, command, tty_mode) = split_run_command(args)?;
     let record = resolve_mount(requested.as_deref(), true)?;
     let cwd = env::current_dir().context("cannot read the current directory")?;
-    execute_remote_argv(&record, &cwd, &command)
+    execute_remote_argv(&record, &cwd, &command, tty_mode)
 }
 
 fn native_sh(args: &[OsString]) -> Result<i32> {
@@ -897,7 +2000,9 @@ fn native_shell(args: &[OsString]) -> Result<i32> {
     let requested = single_optional_name(args)?;
     let record = resolve_mount(requested.as_deref(), true)?;
     let cwd = env::current_dir().context("cannot read the current directory")?;
-    let remote_cwd = remote_working_directory(&record, &cwd)?;
+    let host_cwd = remote_working_directory(&record, &cwd)?;
+    let runtime = effective_runtime(&record, &cwd)?;
+    let remote_cwd = runtime_working_directory(&runtime, &host_cwd)?;
     let environment = effective_environment(&record, &cwd)?;
     wait_for_flush(&record, Duration::from_secs(60))?;
     let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
@@ -907,17 +2012,25 @@ fn native_shell(args: &[OsString]) -> Result<i32> {
     }
     body.push_str("set +e\n");
     body.push_str("exec ${SHELL:-/bin/sh} -l");
-    let remote_command = wrap_environment_shell(&environment, &body);
+    let inner = wrap_environment_shell(&environment, &body);
+    let remote_command = wrap_runtime_command(&runtime, &remote_cwd, &inner, true, true);
     let code = run_ssh(&record, true, &remote_command)?;
     let _ = refresh_vfs(&record);
     Ok(code)
 }
 
-fn execute_remote_argv(record: &MountRecord, cwd: &Path, command: &[OsString]) -> Result<i32> {
+fn execute_remote_argv(
+    record: &MountRecord,
+    cwd: &Path,
+    command: &[OsString],
+    tty_mode: TtyMode,
+) -> Result<i32> {
     if command.is_empty() {
         bail!("remote command is empty");
     }
-    let remote_cwd = remote_working_directory(record, cwd)?;
+    let host_cwd = remote_working_directory(record, cwd)?;
+    let runtime = effective_runtime(record, cwd)?;
+    let remote_cwd = runtime_working_directory(&runtime, &host_cwd)?;
     let environment = effective_environment(record, cwd)?;
     wait_for_flush(record, Duration::from_secs(60))?;
     let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
@@ -931,14 +2044,48 @@ fn execute_remote_argv(record: &MountRecord, cwd: &Path, command: &[OsString]) -
         body.push(' ');
         body.push_str(&quote_posix(&arg.to_string_lossy()));
     }
-    let remote_command = wrap_environment_shell(&environment, &body);
-    let code = run_ssh(record, false, &remote_command)?;
+    let wants_pty = command_should_use_pty(command, tty_mode);
+    let inner = wrap_environment_shell(&environment, &body);
+    let remote_command = wrap_runtime_command(&runtime, &remote_cwd, &inner, wants_pty, wants_pty);
+    let code = run_ssh(record, wants_pty, &remote_command)?;
     let _ = refresh_vfs(record);
     Ok(code)
 }
 
+fn command_should_use_pty(command: &[OsString], mode: TtyMode) -> bool {
+    match mode {
+        TtyMode::Force => return true,
+        TtyMode::Never => return false,
+        TtyMode::Auto => {}
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return false;
+    }
+    let Some(tool) = command.first().map(|value| {
+        Path::new(value)
+            .file_stem()
+            .unwrap_or(value.as_os_str())
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    }) else {
+        return false;
+    };
+    let args = &command[1..];
+    let has = |needle: &str| args.iter().any(|arg| arg == OsStr::new(needle));
+    match tool.as_str() {
+        "python" | "python3" => args.is_empty() || has("-i"),
+        "node" => args.is_empty() || has("-i") || has("--interactive"),
+        "bash" | "sh" => args.is_empty(),
+        "gdb" | "lldb" => !has("--batch") && !has("-batch") && !has("--version"),
+        "top" | "htop" | "less" | "ipython" => true,
+        _ => false,
+    }
+}
+
 fn execute_remote_shell(record: &MountRecord, cwd: &Path, shell_text: &str) -> Result<i32> {
-    let remote_cwd = remote_working_directory(record, cwd)?;
+    let host_cwd = remote_working_directory(record, cwd)?;
+    let runtime = effective_runtime(record, cwd)?;
+    let remote_cwd = runtime_working_directory(&runtime, &host_cwd)?;
     let environment = effective_environment(record, cwd)?;
     wait_for_flush(record, Duration::from_secs(60))?;
     let mut body = format!("set -e\ncd -- {}\n", quote_posix(&remote_cwd));
@@ -948,7 +2095,8 @@ fn execute_remote_shell(record: &MountRecord, cwd: &Path, shell_text: &str) -> R
     }
     body.push_str("set +e\n");
     body.push_str(shell_text);
-    let remote_command = wrap_environment_shell(&environment, &body);
+    let inner = wrap_environment_shell(&environment, &body);
+    let remote_command = wrap_runtime_command(&runtime, &remote_cwd, &inner, false, false);
     let code = run_ssh(record, false, &remote_command)?;
     let _ = refresh_vfs(record);
     Ok(code)
@@ -1037,6 +2185,488 @@ fn effective_environment(record: &MountRecord, cwd: &Path) -> Result<EffectiveEn
         init,
         active,
     })
+}
+
+fn effective_runtime(record: &MountRecord, cwd: &Path) -> Result<EffectiveRuntime> {
+    let Some(config_path) = find_workspace_config(record, cwd) else {
+        let root = resolve_remote_root(record)?;
+        return Ok(EffectiveRuntime {
+            kind: "host".to_string(),
+            container: String::new(),
+            host_root: root.clone(),
+            runtime_root: root,
+        });
+    };
+    let text = fs::read_to_string(&config_path)
+        .with_context(|| format!("cannot read {}", config_path.display()))?;
+    let config: WorkspaceConfig = toml::from_str(&text).with_context(|| {
+        format!(
+            "invalid CloudFolder workspace config {}",
+            config_path.display()
+        )
+    })?;
+    let kind = config.runtime.kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "host" | "docker" | "podman") {
+        bail!("runtime.type must be host, docker, or podman");
+    }
+    let config_parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("workspace config has no parent directory"))?;
+    let inferred_host_root = remote_working_directory(record, config_parent)?;
+    let host_root = if config.runtime.host_root.trim().is_empty() {
+        inferred_host_root
+    } else {
+        normalize_remote_root(&config.runtime.host_root)
+    };
+    if !host_root.starts_with('/') {
+        bail!("runtime.host_root must be an absolute Linux path");
+    }
+    if kind == "host" {
+        return Ok(EffectiveRuntime {
+            kind,
+            container: String::new(),
+            host_root: host_root.clone(),
+            runtime_root: host_root,
+        });
+    }
+    if config.runtime.container.trim().is_empty() {
+        bail!("runtime.container is required for {} runtime", kind);
+    }
+    let runtime_root = config.runtime.runtime_root.trim().to_string();
+    if !runtime_root.starts_with('/') {
+        bail!("runtime.runtime_root must be an absolute path for container runtimes");
+    }
+    Ok(EffectiveRuntime {
+        kind,
+        container: config.runtime.container,
+        host_root,
+        runtime_root: normalize_remote_root(&runtime_root),
+    })
+}
+
+fn runtime_working_directory(runtime: &EffectiveRuntime, host_cwd: &str) -> Result<String> {
+    if runtime.kind == "host" {
+        return Ok(host_cwd.to_string());
+    }
+    let host_root = normalize_remote_root(&runtime.host_root);
+    let cwd = normalize_remote_root(host_cwd);
+    let relative = if cwd == host_root {
+        ""
+    } else if host_root == "/" {
+        cwd.trim_start_matches('/')
+    } else if let Some(rest) = cwd.strip_prefix(&(host_root.clone() + "/")) {
+        rest
+    } else {
+        bail!(
+            "host cwd '{}' is outside runtime.host_root '{}'",
+            host_cwd,
+            runtime.host_root
+        );
+    };
+    if relative.is_empty() {
+        Ok(runtime.runtime_root.clone())
+    } else if runtime.runtime_root == "/" {
+        Ok(format!("/{relative}"))
+    } else {
+        Ok(format!(
+            "{}/{relative}",
+            runtime.runtime_root.trim_end_matches('/')
+        ))
+    }
+}
+
+fn wrap_runtime_command(
+    runtime: &EffectiveRuntime,
+    runtime_cwd: &str,
+    inner: &str,
+    tty: bool,
+    stdin: bool,
+) -> String {
+    if runtime.kind == "host" {
+        return inner.to_string();
+    }
+    let mut flags = Vec::new();
+    if stdin {
+        flags.push("-i");
+    }
+    if tty {
+        flags.push("-t");
+    }
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", flags.join(" "))
+    };
+    format!(
+        "{} exec {}-w {} {} sh -lc {}",
+        runtime.kind,
+        flags,
+        quote_posix(runtime_cwd),
+        quote_posix(&runtime.container),
+        quote_posix(inner)
+    )
+}
+
+fn wrap_runtime_job_command(
+    runtime: &EffectiveRuntime,
+    runtime_cwd: &str,
+    inner: &str,
+    job_id: &str,
+) -> String {
+    if runtime.kind == "host" {
+        return inner.to_string();
+    }
+    format!(
+        "{} exec -e {} -w {} {} sh -lc {}",
+        runtime.kind,
+        quote_posix(&format!("CLOUDFOLDER_JOB_ID={job_id}")),
+        quote_posix(runtime_cwd),
+        quote_posix(&runtime.container),
+        quote_posix(inner)
+    )
+}
+
+fn start_runtime_forward_target(
+    record: &MountRecord,
+    runtime: &EffectiveRuntime,
+    target_port: u16,
+) -> Result<RuntimeForwardTarget> {
+    if runtime.kind == "host" {
+        return Ok(RuntimeForwardTarget {
+            host: "127.0.0.1".to_string(),
+            port: target_port,
+            label: "host 127.0.0.1".to_string(),
+            relay_pid: 0,
+            relay_id: String::new(),
+        });
+    }
+    if !matches!(runtime.kind.as_str(), "docker" | "podman") {
+        bail!("runtime forwarding is unsupported for '{}'", runtime.kind);
+    }
+    let free_port_command = "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'";
+    let (port_code, port_stdout, port_stderr) = run_ssh_capture(record, free_port_command)?;
+    if port_code != 0 {
+        bail!(
+            "could not allocate runtime relay port: {}",
+            port_stderr.trim()
+        );
+    }
+    let relay_port: u16 = port_stdout
+        .trim()
+        .parse()
+        .context("remote host returned an invalid runtime relay port")?;
+    let relay_id = format!(
+        "cf-relay-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let script = remote_runtime_relay_script();
+    let marker = format!("CLOUDFOLDER_RELAY_ID={relay_id}");
+    let remote = format!(
+        "set -eu; d=\"$HOME/.cloudfolder/relays\"; mkdir -p \"$d\"; ready=\"$d/{relay_id}.ready\"; log=\"$d/{relay_id}.log\"; rm -f \"$ready\" \"$log\"; {marker} nohup setsid python3 -u -c {script} {engine} {container} {listen_port} {target_port} \"$ready\" > \"$log\" 2>&1 < /dev/null & p=$!; printf '%s\\n' \"$p\"",
+        relay_id = relay_id,
+        marker = marker,
+        script = quote_posix(&script),
+        engine = quote_posix(&runtime.kind),
+        container = quote_posix(&runtime.container),
+        listen_port = relay_port,
+        target_port = target_port,
+    );
+    let (code, stdout, stderr) = fresh_ssh_capture(record, &remote)?;
+    if code != 0 {
+        bail!("could not start runtime relay: {}", stderr.trim());
+    }
+    let relay_pid: u32 = stdout
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .context("runtime relay returned an invalid pid")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let check = format!(
+            "test -s \"$HOME/.cloudfolder/relays/{relay_id}.ready\" && printf ready || true"
+        );
+        let (_, out, _) = run_ssh_capture(record, &check)?;
+        if out.trim() == "ready" {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let (_, log, _) = run_ssh_capture(
+                record,
+                &format!("cat \"$HOME/.cloudfolder/relays/{relay_id}.log\" 2>/dev/null || true"),
+            )?;
+            let _ = stop_runtime_relay(record, relay_pid, &relay_id);
+            bail!("runtime relay did not become ready: {}", log.trim());
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    Ok(RuntimeForwardTarget {
+        host: "127.0.0.1".to_string(),
+        port: relay_port,
+        label: format!("{} {} via relay", runtime.kind, runtime.container),
+        relay_pid,
+        relay_id,
+    })
+}
+
+fn stop_runtime_relay(record: &MountRecord, relay_pid: u32, relay_id: &str) -> Result<()> {
+    if relay_pid == 0 || relay_id.is_empty() {
+        return Ok(());
+    }
+    let marker = quote_posix(&format!("CLOUDFOLDER_RELAY_ID={relay_id}"));
+    let remote = format!(
+        "p={relay_pid}; if [ -r /proc/$p/environ ] && tr '\\000' '\\n' < /proc/$p/environ | grep -qx {marker}; then kill -TERM -- -$p 2>/dev/null || kill -TERM $p 2>/dev/null || true; fi; rm -f $HOME/.cloudfolder/relays/{relay_id}.ready $HOME/.cloudfolder/relays/{relay_id}.log"
+    );
+    let _ = run_ssh_capture(record, &remote)?;
+    Ok(())
+}
+
+fn remote_runtime_relay_script() -> String {
+    r#"import socket,subprocess,threading,sys,os
+engine,container,listen_port,target_port,ready=sys.argv[1],sys.argv[2],int(sys.argv[3]),int(sys.argv[4]),sys.argv[5]
+inner=r'''import socket,sys,threading,os
+s=socket.create_connection(('127.0.0.1',int(sys.argv[1])))
+def upstream():
+    try:
+        while True:
+            data=os.read(0,65536)
+            if not data: break
+            s.sendall(data)
+    finally:
+        try: s.shutdown(socket.SHUT_WR)
+        except Exception: pass
+threading.Thread(target=upstream,daemon=True).start()
+while True:
+    data=s.recv(65536)
+    if not data: break
+    os.write(1,data)
+'''
+def handle(conn):
+    p=subprocess.Popen([engine,'exec','-i',container,'python3','-u','-c',inner,str(target_port)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,bufsize=0)
+    def upstream():
+        try:
+            while True:
+                data=conn.recv(65536)
+                if not data: break
+                p.stdin.write(data); p.stdin.flush()
+        except Exception: pass
+        finally:
+            try: p.stdin.close()
+            except Exception: pass
+    threading.Thread(target=upstream,daemon=True).start()
+    try:
+        while True:
+            data=os.read(p.stdout.fileno(),65536)
+            if not data: break
+            conn.sendall(data)
+    except Exception: pass
+    finally:
+        try: conn.close()
+        except Exception: pass
+        if p.poll() is None: p.terminate()
+        try: p.wait(timeout=2)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+ls=socket.socket(); ls.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); ls.bind(('127.0.0.1',listen_port)); ls.listen(64)
+open(ready,'w').write(str(os.getpid()))
+while True:
+    conn,addr=ls.accept(); threading.Thread(target=handle,args=(conn,),daemon=True).start()
+"#
+    .to_string()
+}
+
+fn protocol_path_mapper(
+    record: &MountRecord,
+    cwd: &Path,
+    runtime: &EffectiveRuntime,
+) -> Result<ProtocolPathMapper> {
+    let local_root = find_workspace_config(record, cwd)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from(&record.mount_point));
+    let host_root = remote_working_directory(record, &local_root)?;
+    let runtime_root = runtime_working_directory(runtime, &host_root)?;
+    Ok(ProtocolPathMapper {
+        mount_slug: record.slug.clone(),
+        local_root,
+        runtime_root,
+    })
+}
+
+impl ProtocolPathMapper {
+    fn local_path_to_runtime(&self, path: &Path) -> Option<String> {
+        let relative = relative_components(path, &self.local_root)?;
+        if relative.is_empty() {
+            return Some(self.runtime_root.clone());
+        }
+        let suffix = relative
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if self.runtime_root == "/" {
+            Some(format!("/{suffix}"))
+        } else {
+            Some(format!(
+                "{}/{suffix}",
+                self.runtime_root.trim_end_matches('/')
+            ))
+        }
+    }
+
+    fn runtime_path_to_local(&self, path: &str) -> Option<PathBuf> {
+        let runtime_root = normalize_remote_root(&self.runtime_root);
+        let normalized = normalize_remote_root(path);
+        let relative = if normalized == runtime_root {
+            ""
+        } else if runtime_root == "/" {
+            normalized.trim_start_matches('/')
+        } else {
+            normalized.strip_prefix(&(runtime_root.clone() + "/"))?
+        };
+        let mut local = self.local_root.clone();
+        for part in relative.split('/').filter(|part| !part.is_empty()) {
+            local.push(part);
+        }
+        Some(local)
+    }
+
+    fn client_to_runtime_string(&self, value: &str) -> String {
+        if let Ok(url) = Url::parse(value) {
+            if url.scheme() == "file" {
+                if let Ok(local) = url.to_file_path() {
+                    if let Some(remote) = self.local_path_to_runtime(&local) {
+                        return remote_file_uri(&remote);
+                    }
+                }
+            } else if url.scheme() == "cloudfolder-runtime"
+                && url
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case(&self.mount_slug))
+            {
+                let decoded = percent_decode_str(url.path()).decode_utf8_lossy();
+                if decoded.starts_with('/') {
+                    return remote_file_uri(&decoded);
+                }
+            }
+        }
+        let path = PathBuf::from(value);
+        self.local_path_to_runtime(&path)
+            .unwrap_or_else(|| value.to_string())
+    }
+
+    fn runtime_to_client_string(&self, value: &str) -> String {
+        if let Ok(url) = Url::parse(value) {
+            if url.scheme() == "file" {
+                let decoded = percent_decode_str(url.path()).decode_utf8_lossy();
+                if let Some(local) = self.runtime_path_to_local(&decoded) {
+                    if let Ok(local_url) = Url::from_file_path(&local) {
+                        return local_url.to_string();
+                    }
+                }
+                if decoded.starts_with('/') {
+                    return runtime_source_uri(&self.mount_slug, &decoded);
+                }
+            }
+        }
+        if let Some(local) = self.runtime_path_to_local(value) {
+            return local.to_string_lossy().to_string();
+        }
+        value.to_string()
+    }
+}
+
+fn remote_file_uri(path: &str) -> String {
+    let mut url = Url::parse("file:///").expect("static file URL is valid");
+    url.set_path(path);
+    url.to_string()
+}
+
+fn runtime_source_uri(mount_slug: &str, path: &str) -> String {
+    let mut url = Url::parse(&format!("cloudfolder-runtime://{mount_slug}/"))
+        .expect("CloudFolder mount slugs are URL-safe host names");
+    url.set_path(path);
+    url.to_string()
+}
+
+fn rewrite_protocol_json(
+    bytes: &[u8],
+    mapper: &ProtocolPathMapper,
+    client_to_runtime: bool,
+) -> Result<Vec<u8>> {
+    let mut value: Value =
+        serde_json::from_slice(bytes).context("invalid protocol JSON payload")?;
+    rewrite_protocol_value(&mut value, mapper, client_to_runtime);
+    serde_json::to_vec(&value).context("serializing rewritten protocol payload")
+}
+
+fn rewrite_protocol_value(value: &mut Value, mapper: &ProtocolPathMapper, client_to_runtime: bool) {
+    match value {
+        Value::String(text) => {
+            *text = if client_to_runtime {
+                mapper.client_to_runtime_string(text)
+            } else {
+                mapper.runtime_to_client_string(text)
+            };
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_protocol_value(item, mapper, client_to_runtime);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                rewrite_protocol_value(item, mapper, client_to_runtime);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn read_protocol_message<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+    let mut content_length = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let count = reader.read_line(&mut line)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("Content-Length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .context("invalid protocol Content-Length")?,
+                );
+            }
+        }
+    }
+    let length =
+        content_length.ok_or_else(|| anyhow!("protocol message missing Content-Length"))?;
+    if length > 64 * 1024 * 1024 {
+        bail!("protocol message exceeds 64 MiB");
+    }
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body)?;
+    Ok(Some(body))
+}
+
+fn write_protocol_message<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(body)?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn find_workspace_config(record: &MountRecord, cwd: &Path) -> Option<PathBuf> {
@@ -1485,9 +3115,18 @@ fn normalize_remote_root(value: &str) -> String {
 }
 
 fn run_ssh(record: &MountRecord, tty: bool, remote_command: &str) -> Result<i32> {
+    if !tty && env::var_os("CLOUDFOLDER_DISABLE_TRANSPORT").is_none() {
+        if let Ok(code) = run_via_transport(record, remote_command) {
+            return Ok(code);
+        }
+    }
+    fresh_ssh(record, tty, remote_command)
+}
+
+fn fresh_ssh(record: &MountRecord, tty: bool, remote_command: &str) -> Result<i32> {
     let mut command = ssh_command(record)?;
     if tty {
-        command.arg("-t");
+        command.arg("-tt");
     }
     command.arg(ssh_target(record)).arg(remote_command);
     let status = command
@@ -1497,6 +3136,15 @@ fn run_ssh(record: &MountRecord, tty: bool, remote_command: &str) -> Result<i32>
 }
 
 fn run_ssh_capture(record: &MountRecord, remote_command: &str) -> Result<(i32, String, String)> {
+    if env::var_os("CLOUDFOLDER_DISABLE_TRANSPORT").is_none() {
+        if let Ok(result) = run_via_transport_capture(record, remote_command) {
+            return Ok(result);
+        }
+    }
+    fresh_ssh_capture(record, remote_command)
+}
+
+fn fresh_ssh_capture(record: &MountRecord, remote_command: &str) -> Result<(i32, String, String)> {
     let output = ssh_command(record)?
         .arg(ssh_target(record))
         .arg(remote_command)
@@ -1763,9 +3411,14 @@ fn forward_process_matches(state: &ForwardState) -> bool {
         return false;
     }
     let command_line = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    let tunnel_port = if state.tunnel_port == 0 {
+        state.remote_port
+    } else {
+        state.tunnel_port
+    };
     let forward = format!(
-        "127.0.0.1:{}:127.0.0.1:{}",
-        state.local_port, state.remote_port
+        "127.0.0.1:{}:{}:{}",
+        state.local_port, state.remote_host, tunnel_port
     );
     command_line.contains("ssh") && command_line.contains(&forward)
 }
@@ -1787,6 +3440,33 @@ fn split_remote_command(args: &[OsString]) -> Result<(Option<String>, Vec<OsStri
         .first()
         .map(|value| value.to_string_lossy().to_string());
     Ok((requested, command))
+}
+
+fn split_run_command(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>, TtyMode)> {
+    let delimiter = args
+        .iter()
+        .position(|value| value == OsStr::new("--"))
+        .ok_or_else(|| anyhow!("expected -- before the remote command"))?;
+    let mut requested = None;
+    let mut tty_mode = TtyMode::Auto;
+    for arg in &args[..delimiter] {
+        match arg.to_string_lossy().as_ref() {
+            "--pty" => tty_mode = TtyMode::Force,
+            "--no-pty" => tty_mode = TtyMode::Never,
+            value if value.starts_with('-') => bail!("unknown cf run option '{value}'"),
+            value => {
+                if requested.is_some() {
+                    bail!("pass at most one mount name before --");
+                }
+                requested = Some(value.to_string());
+            }
+        }
+    }
+    let command = args[delimiter + 1..].to_vec();
+    if command.is_empty() {
+        bail!("a remote command is required after --");
+    }
+    Ok((requested, command, tty_mode))
 }
 
 fn single_optional_name(args: &[OsString]) -> Result<Option<String>> {
@@ -1869,6 +3549,29 @@ mod tests {
     }
 
     #[test]
+    fn run_split_preserves_explicit_pty_modes() {
+        let forced = vec![
+            OsString::from("--pty"),
+            OsString::from("lab"),
+            OsString::from("--"),
+            OsString::from("python3"),
+        ];
+        let (mount, command, mode) = split_run_command(&forced).unwrap();
+        assert_eq!(mount.as_deref(), Some("lab"));
+        assert_eq!(command, vec![OsString::from("python3")]);
+        assert_eq!(mode, TtyMode::Force);
+
+        let never = vec![
+            OsString::from("--no-pty"),
+            OsString::from("--"),
+            OsString::from("pytest"),
+            OsString::from("-q"),
+        ];
+        let (_, _, mode) = split_run_command(&never).unwrap();
+        assert_eq!(mode, TtyMode::Never);
+    }
+
+    #[test]
     fn router_only_claims_remote_runtime_tools() {
         assert_eq!(routed_tool_from_exe_name("git").as_deref(), Some("git"));
         assert_eq!(
@@ -1946,6 +3649,71 @@ init = "export DEVICE=cpu"
     }
 
     #[test]
+    fn workspace_container_runtime_maps_host_and_runtime_cwd() {
+        let root = unique_test_dir("runtime-root");
+        let nested = root.join("repo").join("src");
+        let data = unique_test_dir("runtime-data");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            root.join(".cloudfolder.toml"),
+            r#"[runtime]
+type = "docker"
+container = "dev-container"
+runtime_root = "/workspace"
+"#,
+        )
+        .unwrap();
+        let record = test_mount(&root, &data);
+        let runtime = effective_runtime(&record, &nested).unwrap();
+        assert_eq!(runtime.kind, "docker");
+        assert_eq!(runtime.container, "dev-container");
+        assert_eq!(runtime.host_root, "/workspace");
+        assert_eq!(runtime.runtime_root, "/workspace");
+        assert_eq!(
+            runtime_working_directory(&runtime, "/workspace/repo/src").unwrap(),
+            "/workspace/repo/src"
+        );
+        let wrapped = wrap_runtime_command(
+            &runtime,
+            "/workspace/repo/src",
+            "python3 main.py",
+            true,
+            true,
+        );
+        assert!(wrapped.contains("docker exec -i -t"));
+        assert!(wrapped.contains("dev-container"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn protocol_mapper_round_trips_workspace_and_external_runtime_sources() {
+        let root = unique_test_dir("protocol-root");
+        let local = root.join("子 folder").join("main.py");
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        fs::write(&local, b"print('ok')\n").unwrap();
+        let mapper = ProtocolPathMapper {
+            mount_slug: "lab".to_string(),
+            local_root: root.clone(),
+            runtime_root: "/workspace".to_string(),
+        };
+        let local_uri = Url::from_file_path(&local).unwrap().to_string();
+        let runtime_uri = mapper.client_to_runtime_string(&local_uri);
+        assert!(runtime_uri.starts_with("file:///workspace/"));
+        assert!(runtime_uri.contains("%E5%AD%90%20folder"));
+        assert_eq!(mapper.runtime_to_client_string(&runtime_uri), local_uri);
+
+        let external = mapper.runtime_to_client_string("file:///usr/local/lib/site.py");
+        assert_eq!(external, "cloudfolder-runtime://lab/usr/local/lib/site.py");
+        assert_eq!(
+            mapper.client_to_runtime_string(&external),
+            "file:///usr/local/lib/site.py"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn environment_shell_wraps_one_remote_body() {
         let environment = EffectiveEnvironment {
             config_path: None,
@@ -1970,6 +3738,11 @@ init = "export DEVICE=cpu"
             mount_slug: "test".to_string(),
             remote_port: 8888,
             local_port: 18888,
+            remote_host: "127.0.0.1".to_string(),
+            target_label: "docker dev via relay".to_string(),
+            tunnel_port: 18889,
+            relay_pid: 4321,
+            relay_id: "relay-test".to_string(),
             pid: 1234,
             started_epoch: 42,
         };
@@ -1978,6 +3751,10 @@ init = "export DEVICE=cpu"
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].remote_port, 8888);
         assert_eq!(loaded[0].local_port, 18888);
+        assert_eq!(loaded[0].tunnel_port, 18889);
+        assert_eq!(loaded[0].relay_pid, 4321);
+        assert_eq!(loaded[0].relay_id, "relay-test");
+        assert_eq!(loaded[0].target_label, "docker dev via relay");
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(data).unwrap();
     }

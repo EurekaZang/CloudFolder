@@ -18,6 +18,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
     cargo "+$Toolchain" clippy --all-targets -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed with exit code $LASTEXITCODE" }
+    node --check (Join-Path $Root 'editors\vscode\extension.js')
+    if ($LASTEXITCODE -ne 0) { throw "VS Code extension syntax check failed with exit code $LASTEXITCODE" }
+    node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" (Join-Path $Root 'editors\vscode\package.json')
+    if ($LASTEXITCODE -ne 0) { throw "VS Code extension manifest check failed with exit code $LASTEXITCODE" }
     cargo "+$Toolchain" build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit code $LASTEXITCODE" }
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null

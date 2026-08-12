@@ -21,3 +21,12 @@ init = ""
 init = """
 export CUDA_VISIBLE_DEVICES=1
 """
+
+[runtime]
+# "host" (default), "docker", or "podman".
+type = "host"
+
+# For container runtimes:
+# container = "isaaclab"
+# host_root = "/home/alice/project"   # optional; defaults to this config's directory
+# runtime_root = "/workspace"
